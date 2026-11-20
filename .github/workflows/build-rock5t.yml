@@ -1,0 +1,76 @@
+name: Build LibreELEC RK3588 (Rock 5T)
+
+on:
+  workflow_dispatch:
+    inputs:
+      uboot_system:
+        description: 'UBOOT_SYSTEM target (rock-5t or rock-5b)'
+        required: true
+        default: 'rock-5t'
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Check Disk Space
+        run: df -h
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install LibreELEC build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison bzip2 ccache file flex g++ gawk gcc git gperf \
+            libelf-dev libncurses-dev libssl-dev lzop make patch \
+            perl python3 rdfind texinfo unzip wget xfonts-utils \
+            xsltproc xz-utils zip zstd
+
+      - name: Cache LibreELEC sources
+        uses: actions/cache@v4
+        with:
+          path: sources
+          key: le-sources-rockchip-rk3588-${{ hashFiles('packages/**/package.mk') }}
+          restore-keys: |
+            le-sources-rockchip-rk3588-
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: le-ccache-rk3588-${{ github.sha }}
+          restore-keys: |
+            le-ccache-rk3588-
+
+      - name: Build LibreELEC image
+        run: |
+          export CCACHE_DIR="${HOME}/.ccache"
+          export CCACHE_MAXSIZE="5G"
+          PROJECT=Rockchip DEVICE=RK3588 ARCH=aarch64 UBOOT_SYSTEM="${{ inputs.uboot_system }}" make image
+
+      - name: List target artifacts
+        run: ls -lh target/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: LibreELEC-RK3588-${{ inputs.uboot_system }}
+          path: |
+            target/*.img.gz
+            target/*.tar
+          retention-days: 14

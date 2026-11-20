@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2019-present Team LibreELEC (https://libreelec.tv)
+
+echo "${BOOTLOADER}: creating u-boot.bin"
+
+DESTDIR="${PKG_BUILD}/fip"
+mkdir -p "${DESTDIR}"
+
+FIPDIR="$(get_build_dir amlogic-boot-fip)"
+
+case "${UBOOT_SYSTEM}" in
+  box|"")
+    # no-op, use vendor bootloader
+    ;;
+  *)
+    mkdir "${DESTDIR}/tmp"
+    (cd "${FIPDIR}" || exit; ./build-fip.sh "${UBOOT_SYSTEM}" "$(get_build_dir "${BOOTLOADER}")/u-boot.bin" "${DESTDIR}" "${DESTDIR}/tmp")
+    rm -fr "${DESTDIR}/tmp"
+    ;;
+esac
+
+# Clean up after previous build
+rm -rf "${INSTALL}"/usr/share/bootloader/boot.ini
+rm -rf "${INSTALL}"/usr/share/bootloader/u-boot*
+
+# Install u-boot
+if [ "${UBOOT_SYSTEM}" != "box" ]; then
+  if [ -f "${DESTDIR}/u-boot.bin.sd.bin.signed" ]; then
+    UBOOT="u-boot.bin.sd.bin.signed"
+  elif [ -f "${DESTDIR}/u-boot.bin.sd.bin" ]; then
+    UBOOT="u-boot.bin.sd.bin"
+  elif [ -f "${DESTDIR}/u-boot.bin" ]; then
+    UBOOT="u-boot.bin"
+  fi
+
+  # Copy to u-boot.bin.sd.bin before mkimage
+  mkdir -p "${INSTALL}/usr/share/bootloader"
+  cp -av "${DESTDIR}/${UBOOT}" "${INSTALL}/usr/share/bootloader/u-boot.bin.sd.bin"
+
+  # If target/u-boot exists, cache the signed bin
+  if [ -d "${ROOT}/target/u-boot" ]; then
+    cp -av "${DESTDIR}/${UBOOT}" "${ROOT}/target/u-boot/${UBOOT}-${UBOOT_SYSTEM}"
+  fi
+fi
+
+# Install boot.ini if it exists
+if find_file_path bootloader/"${UBOOT_SYSTEM}".ini; then
+  cp -av "${FOUND_PATH}" "${INSTALL}/usr/share/bootloader/boot.ini"
+fi
