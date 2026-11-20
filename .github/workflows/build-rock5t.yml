@@ -36,10 +36,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            bc bison bzip2 ccache file flex g++ gawk gcc git gperf \
-            libelf-dev libncurses-dev libssl-dev lzop make patch \
-            perl python3 rdfind texinfo unzip wget xfonts-utils \
-            xsltproc xz-utils zip zstd
+            bash bc bison bzip2 ccache curl default-jre diffutils file flex \
+            g++ gawk gcc git gperf gzip libc6-dev libelf-dev libjson-perl \
+            libncurses-dev libparse-yapp-perl libssl-dev libxml-parser-perl \
+            lzop make patch patchutils perl python3 python3-mako \
+            python3-setuptools python3-yaml rdfind rsync sed tar texinfo \
+            unzip wget xfonts-utils xsltproc xz-utils zip zstd
+          PROJECT=Rockchip DEVICE=RK3588 ARCH=aarch64 ./scripts/checkdeps < /dev/null
 
       - name: Cache LibreELEC sources
         uses: actions/cache@v4
