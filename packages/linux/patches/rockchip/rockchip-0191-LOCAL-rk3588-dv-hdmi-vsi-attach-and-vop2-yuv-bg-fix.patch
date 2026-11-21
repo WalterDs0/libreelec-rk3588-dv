@@ -92,7 +92,7 @@ diff -ruN a/drivers/gpu/drm/drm_connector.c b/drivers/gpu/drm/drm_connector.c
 diff -ruN a/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c b/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c
 --- a/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c	2026-11-21 13:02:23
 +++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c	2026-11-21 13:17:00
-@@ -1626,9 +1626,14 @@
+@@ -1626,9 +1626,16 @@
  	 * Since performance is more important than accuracy here,
  	 * make use of the DRM_ARGB64_GET*_BPCS() helpers.
  	 */
