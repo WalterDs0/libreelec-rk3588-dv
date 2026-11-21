@@ -35,8 +35,8 @@ Subject: [PATCH] drm/display: hdmi: Implement the "Dolby Vision" property
 +		return -EINVAL;
 +	}
 +
-+	if (conn_state->hdmi.output_format != DRM_OUTPUT_COLOR_FORMAT_RGB444) {
-+		enum drm_output_color_format format = conn_state->hdmi.output_format;
++	if (conn_state->hdmi.output_format != HDMI_COLORSPACE_RGB) {
++		enum hdmi_colorspace format = conn_state->hdmi.output_format;
 +
 +		drm_dbg_kms(dev, "Dolby Vision needs RGB output, not %s.\n",
 +			    drm_hdmi_connector_get_output_format_name(format));
