@@ -27,6 +27,39 @@ The HDMI state helper implements the property in the next patch.
  include/drm/drm_connector.h       | 39 +++++++++++++
  4 files changed, 141 insertions(+)
 
+diff --git a/drivers/gpu/drm/drm_atomic.c b/drivers/gpu/drm/drm_atomic.c
+--- a/drivers/gpu/drm/drm_atomic.c
++++ b/drivers/gpu/drm/drm_atomic.c
+@@ -1320,6 +1320,8 @@
+ 	    connector->connector_type == DRM_MODE_CONNECTOR_HDMIB) {
+ 		drm_printf(p, "\tbroadcast_rgb=%s\n",
+ 			   drm_hdmi_connector_get_broadcast_rgb_name(state->hdmi.broadcast_rgb));
++		drm_printf(p, "\tdolby_vision=%s\n",
++			   drm_hdmi_connector_get_dolby_vision_name(state->hdmi.dolby_vision));
+ 		drm_printf(p, "\tis_limited_range=%c\n", state->hdmi.is_limited_range ? 'y' : 'n');
+ 		drm_printf(p, "\toutput_bpc=%u\n", state->hdmi.output_bpc);
+ 		drm_printf(p, "\toutput_format=%s\n",
+diff --git a/drivers/gpu/drm/drm_atomic_uapi.c b/drivers/gpu/drm/drm_atomic_uapi.c
+--- a/drivers/gpu/drm/drm_atomic_uapi.c
++++ b/drivers/gpu/drm/drm_atomic_uapi.c
+@@ -928,6 +928,8 @@
+ 		}
+ 
+ 		state->color_format = val ? BIT(val - 1) : DRM_COLOR_FORMAT_AUTO;
++	} else if (property == connector->dolby_vision_property) {
++		state->hdmi.dolby_vision = val;
+ 	} else if (connector->funcs->atomic_set_property) {
+ 		return connector->funcs->atomic_set_property(connector,
+ 				state, property, val);
+@@ -1015,6 +1017,8 @@
+ 		*val = state->hdmi.broadcast_rgb;
+ 	} else if (property == connector->color_format_property) {
+ 		*val = ffs(state->color_format);
++	} else if (property == connector->dolby_vision_property) {
++		*val = state->hdmi.dolby_vision;
+ 	} else if (connector->funcs->atomic_get_property) {
+ 		return connector->funcs->atomic_get_property(connector,
+ 				state, property, val);
 diff --git a/drivers/gpu/drm/drm_connector.c b/drivers/gpu/drm/drm_connector.c
 index ed8ae3cb8..a14d4bade 100644
 --- a/drivers/gpu/drm/drm_connector.c
