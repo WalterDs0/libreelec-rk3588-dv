@@ -100,7 +100,9 @@ diff -ruN a/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c b/drivers/gpu/drm/rockc
 -	FIELD_MODIFY(RK3568_VP_DSP_BG__DSP_BG_GREEN, &val, DRM_ARGB64_GETG_BPCS(bgcolor, 10));
 -	FIELD_MODIFY(RK3568_VP_DSP_BG__DSP_BG_BLUE, &val, DRM_ARGB64_GETB_BPCS(bgcolor, 10));
 +	if (is_yuv_output(to_rockchip_crtc_state(crtc->state)->bus_format) &&
-+	    bgcolor == DRM_ARGB64(0xffff, 0, 0, 0)) {
++	    DRM_ARGB64_GETR_BPCS(bgcolor, 10) == 0 &&
++	    DRM_ARGB64_GETG_BPCS(bgcolor, 10) == 0 &&
++	    DRM_ARGB64_GETB_BPCS(bgcolor, 10) == 0) {
 +		val = 0x20010200;
 +	} else {
 +		val = FIELD_PREP(RK3568_VP_DSP_BG__DSP_BG_RED, DRM_ARGB64_GETR_BPCS(bgcolor, 10));
