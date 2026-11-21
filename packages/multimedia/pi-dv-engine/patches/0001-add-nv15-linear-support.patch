@@ -1,0 +1,310 @@
+diff --git a/engine/pi_engine.c b/engine/pi_engine.c
+index f5fd5c7..7ba369a 100644
+--- a/engine/pi_engine.c
++++ b/engine/pi_engine.c
+@@ -113,9 +113,9 @@ enum { NB = sizeof(bindings) / sizeof(bindings[0]) };
+ /* Specialisation keys: P1's constant ids 0..15, and K1_PRE, which selects P0's
+  * shader (its METHOD, ELUP and QUAD are P1's ids); P2's 1..8. */
+ enum { K1_MODE, K1_METHOD, K1_DUAL, K1_KIND0, K1_KIND1, K1_ORDER0, K1_ORDER1, K1_SINGLE, K1_PIECE, K1_ORDER2,
+-       K1_FAST, K1_MARK, K1_GUARD, K1_ELUP, K1_ELOUT, K1_QUAD, K1_PRE, K1_N };
+-enum { K2_ANNEXB, K2_TOP_LEFT, K2_ABLATE, K2_BARS, K2_SINGLE, K2_FULL422, K2_ELUP, K2_OVERLAY, K2_INTERIOR, K2_N };
+-enum { MAX_SPEC = 17, KEY_MAX = K1_N };
++       K1_FAST, K1_MARK, K1_GUARD, K1_ELUP, K1_ELOUT, K1_QUAD, K1_NV15, K1_PRE, K1_N };
++enum { K2_ANNEXB, K2_TOP_LEFT, K2_ABLATE, K2_BARS, K2_SINGLE, K2_FULL422, K2_ELUP, K2_OVERLAY, K2_INTERIOR, K2_NV15, K2_N };
++enum { MAX_SPEC = 18, KEY_MAX = K1_N };
+ /* EL upscales whose vertical filter P1 does (the vertical pairs): Annex B.
+  * Bicubic's 2 column pairs are cheaper filtered in P2, and Lanczos-3's
+  * 6-tap costs P1 about what it saves P2. */
+@@ -2189,7 +2189,13 @@ static void prepare(struct pi_engine *e, const dvvk_plan *p, int has_el)
+ /* ---- per frame ------------------------------------------------------------------- */
+ 
+ /* A frame the passes can read: DRM PRIME, one layer of two planes in
+- * SAND128, objects and offsets in range. Checked before planning. */
++ * SAND128 or linear NV15, objects and offsets in range. Checked before planning. */
++static int frame_is_nv15(const AVFrame *f)
++{
++    const AVDRMFrameDescriptor *d = (const void *)f->data[0];
++    return pi_is_nv15(d->layers[0].format, d->objects[0].format_modifier);
++}
++
+ static int frame_ok(struct pi_engine *e, const AVFrame *f)
+ {
+     const AVDRMFrameDescriptor *d = f->format == AV_PIX_FMT_DRM_PRIME ? (const void *)f->data[0] : NULL;
+@@ -2198,15 +2204,18 @@ static int frame_ok(struct pi_engine *e, const AVFrame *f)
+         WARN_ONCE(e, W_INPUT, "input isn't a DRM PRIME frame with one layer of two planes");
+         return 0;
+     }
+-    if (!pi_is_sand128(d->objects[0].format_modifier)) {
+-        WARN_ONCE(e, W_INPUT, "input isn't SAND128 (modifier %#llx)", (unsigned long long)d->objects[0].format_modifier);
++    int nv15 = pi_is_nv15(d->layers[0].format, d->objects[0].format_modifier);
++    if (!nv15 && !pi_is_sand128(d->objects[0].format_modifier)) {
++        WARN_ONCE(e, W_INPUT, "input isn't SAND128 or linear NV15 (format %#x, modifier %#llx)",
++                  d->layers[0].format, (unsigned long long)d->objects[0].format_modifier);
+         return 0;
+     }
+     for (int p = 0; p < 2; p++) {
+         const AVDRMPlaneDescriptor *pl = &d->layers[0].planes[p];
+-        /* 8-byte aligned: the BL planes are also read as word pairs */
+-        if (pl->object_index < 0 || pl->object_index >= d->nb_objects || pl->offset < 0 || (pl->offset & 7) ||
+-            d->objects[pl->object_index].fd < 0)
++        /* 8-byte aligned for SAND128 (read as word pairs), 4-byte aligned for NV15 (R32UI) */
++        uint32_t align = nv15 ? 3u : 7u;
++        if (pl->object_index < 0 || pl->object_index >= d->nb_objects || pl->offset < 0 || (pl->offset & align) ||
++            (nv15 && (pl->pitch <= 0 || (pl->pitch & 3))) || d->objects[pl->object_index].fd < 0)
+             return 0;
+     }
+     return 1;
+@@ -2241,12 +2250,15 @@ static int bind_inputs(struct pi_engine *e, struct ctx *c, const AVFrame *bl, co
+             views[l * 2 + p] = im->view;
+             o[p] = (uint32_t)(ly->planes[p].offset / 4);
+         }
+-        /* Column heights: the modifier's, else (the Pi decoder: 0 there, luma
+-         * and chroma in separate buffers) each plane's pitch, as yblod's
+-         * import (interop/va.rs) and FFmpeg's SAND code take them. */
+-        uint32_t column = pi_sand_column_height(mod);
+-        o[2] = column ? column : (uint32_t)ly->planes[0].pitch;
+-        o[3] = column ? column : (uint32_t)ly->planes[1].pitch;
++        /* Column heights for SAND128, or pitch in 32-bit words for linear NV15. */
++        if (pi_is_nv15(ly->format, mod)) {
++            o[2] = (uint32_t)(ly->planes[0].pitch / 4);
++            o[3] = (uint32_t)(ly->planes[1].pitch / 4);
++        } else {
++            uint32_t column = pi_sand_column_height(mod);
++            o[2] = column ? column : (uint32_t)ly->planes[0].pitch;
++            o[3] = column ? column : (uint32_t)ly->planes[1].pitch;
++        }
+     }
+     views[4] = c->in[0]->view64;   /* the BL planes as word pairs */
+     views[5] = c->in[1]->view64;
+@@ -2281,7 +2293,7 @@ static void frame_params(struct pi_engine *e, const dvvk_plan *p, const AVFrame
+ }
+ 
+ /* The pipelines' keys for this frame. */
+-static void keys(const struct pi_engine *e, const dvvk_plan *p, uint32_t k1[K1_N], uint32_t k2[K2_N])
++static void keys(const struct pi_engine *e, const dvvk_plan *p, int nv15, uint32_t k1[K1_N], uint32_t k2[K2_N])
+ {
+     const struct route *rt = &e->route;
+     memset(k1, 0, K1_N * 4);
+@@ -2314,6 +2326,7 @@ static void keys(const struct pi_engine *e, const dvvk_plan *p, uint32_t k1[K1_N
+                                                           : 0u;
+     k1[K1_ELOUT] = (e->o.measure & PI_MEASURE_EL_OUT) != 0;
+     k1[K1_QUAD] = e->quad && !(e->o.measure & PI_MEASURE_NO_QUAD);
++    k1[K1_NV15] = (uint32_t)nv15;
+     if (k1[K1_MODE] == PI_MMR_SPLIT || k1[K1_MODE] == PI_MMR_EXACT)
+         k1[K1_GUARD] = rt->guard;
+     memset(k2, 0, K2_N * 4);
+@@ -2323,6 +2336,7 @@ static void keys(const struct pi_engine *e, const dvvk_plan *p, uint32_t k1[K1_N
+     k2[K2_SINGLE] = (uint32_t)(rt->single || rt->piece);
+     k2[K2_FULL422] = rt->piece == 2;
+     k2[K2_ELUP] = k1[K1_ELUP];
++    k2[K2_NV15] = (uint32_t)nv15;
+ }
+ 
+ struct band {
+@@ -3120,7 +3134,7 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
+     if ((uint32_t)f->bl->width != e->w || (uint32_t)f->bl->height != e->h ||
+         (f->el && ((uint32_t)f->el->width > e->w || (uint32_t)f->el->height > e->h || f->el->width < 4 ||
+                    f->el->height < 4)) ||
+-        !frame_ok(e, f->bl) || (f->el && !frame_ok(e, f->el)))
++        !frame_ok(e, f->bl) || (f->el && (!frame_ok(e, f->el) || frame_is_nv15(f->el) != frame_is_nv15(f->bl))))
+         goto out;
+     /* the RPU: rpu_frame's side data, else bl's, else el's */
+     const AVFrame *meta = f->rpu_frame ? f->rpu_frame : f->bl;
+@@ -3257,7 +3271,7 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
+ 
+     /* pipelines */
+     uint32_t k1[K1_N], k2[K2_N], kb[K2_N] = {[K2_BARS] = 1};
+-    keys(e, p, k1, k2);
++    keys(e, p, frame_is_nv15(f->bl), k1, k2);
+     uint32_t k2i[K2_N];
+     memcpy(k2i, k2, sizeof(k2i));
+     k2i[K2_INTERIOR] = 1;
+@@ -3265,7 +3279,7 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
+                p0 = VK_NULL_HANDLE;
+     if (k1[K1_ELUP]) {   /* P0: only the EL selectors matter */
+         uint32_t k0[K1_N] = {[K1_METHOD] = k1[K1_METHOD], [K1_ELUP] = k1[K1_ELUP], [K1_QUAD] = k1[K1_QUAD],
+-                             [K1_PRE] = 1};
++                             [K1_NV15] = k1[K1_NV15], [K1_PRE] = 1};
+         p0 = build(e, 0, k0);
+     }
+     /* the overlay's: the same with OVERLAY, its sampling by the scale (the
+diff --git a/engine/pi_internal.h b/engine/pi_internal.h
+index 0852373..c85a6c7 100644
+--- a/engine/pi_internal.h
++++ b/engine/pi_internal.h
+@@ -6,4 +6,6 @@
+ /* DRM_FORMAT_MOD_BROADCOM_SAND128_COL_HEIGHT(h): vendor 0x07 in bits 56..63,
+  * SAND128 (4) in bits 0..7, the column height in bits 8..55. */
+ enum { PI_MOD_VENDOR_BROADCOM = 0x07, PI_MOD_SAND128 = 4 };
++enum { PI_DRM_FORMAT_NV15 = 0x3531564eU };
+ static inline uint32_t pi_sand_column_height(uint64_t m) { return (uint32_t)((m >> 8) & 0xffffffffu); }
++static inline int pi_is_nv15(uint32_t format, uint64_t mod) { return format == PI_DRM_FORMAT_NV15 && mod == 0; }
+diff --git a/engine/shaders/common.glsl b/engine/shaders/common.glsl
+index d149a88..726c455 100644
+--- a/engine/shaders/common.glsl
++++ b/engine/shaders/common.glsl
+@@ -42,7 +42,8 @@ layout(binding = 2) uniform usamplerBuffer tables64;   // the same buffer as RG3
+ const int T_MAP = 0, T_RES = 1024, T_CMAP = 4096, T_LUTF = 6144, T_LUT64 = 12288, T_SINGLE = 24576,
+           T_WIDE = 27648;
+ 
+-// The BL luma SAND as RG32UI (word pairs: sand_even2).
++// The BL luma as R32UI (NV15) and RG32UI (SAND word pairs: sand_even2).
++layout(binding = 3) uniform usamplerBuffer bl_y;
+ layout(binding = 13) uniform usamplerBuffer bl_y2;
+ 
+ int edge(int p, uint n) { return clamp(p, 0, int(n) - 1); }
+@@ -72,6 +73,48 @@ uvec2 sand_even2(usamplerBuffer pairs, uint base, uint colh, uint q, uint row)
+                  (s != 0u ? a.y : a.x) >> (s == 0u ? 10u : s == 1u ? 0u : 20u)) & 1023u;
+ }
+ 
++// ---- NV15 linear reads (4 x 10-bit packed in 5 bytes, little-endian) ----
++uint nv15_sample(usamplerBuffer buf, uint base_word, uint pitch_words, uint n, uint row)
++{
++    uint bit = n * 10u;
++    uint idx = base_word + row * pitch_words + (bit >> 5);
++    uint sh = bit & 31u;
++    uint lo = texelFetch(buf, int(idx)).r >> sh;
++    uint hi = sh > 22u ? (texelFetch(buf, int(idx + 1u)).r << (32u - sh)) : 0u;
++    return (lo | hi) & 1023u;
++}
++
++uvec2 nv15_even2(usamplerBuffer buf, uint base_word, uint pitch_words, uint q, uint row)
++{
++    uint bit = q * 20u;
++    uint idx = base_word + row * pitch_words + (bit >> 5);
++    uint sh = bit & 31u;
++    uint v = texelFetch(buf, int(idx)).r >> sh;
++    if (sh > 12u)
++        v |= texelFetch(buf, int(idx + 1u)).r << (32u - sh);
++    return uvec2(v & 1023u, (v >> 10u) & 1023u);
++}
++
++uvec4 nv15_4(usamplerBuffer buf, uint base_word, uint pitch_words, uint n, uint row)
++{
++    uint bit = n * 10u;
++    uint idx = base_word + row * pitch_words + (bit >> 5);
++    uint sh = bit & 31u;
++    uint w0 = texelFetch(buf, int(idx)).r;
++    uint w1 = texelFetch(buf, int(idx + 1u)).r;
++    uint lo32 = (w0 >> sh) | (sh != 0u ? (w1 << (32u - sh)) : 0u);
++    uint s3;
++    if (sh == 0u) {
++        s3 = (w0 >> 30u) | (w1 << 2u);
++    } else {
++        uint sh3 = sh - 2u;
++        s3 = w1 >> sh3;
++        if (sh3 > 22u)
++            s3 |= texelFetch(buf, int(idx + 2u)).r << (32u - sh3);
++    }
++    return uvec4(lo32 & 1023u, (lo32 >> 10u) & 1023u, (lo32 >> 20u) & 1023u, s3 & 1023u);
++}
++
+ // a + b, mod 2^64 (lo, hi words)
+ uvec2 add64(uvec2 a, uvec2 b)
+ {
+diff --git a/engine/shaders/el_chroma.glsl b/engine/shaders/el_chroma.glsl
+index 8dd5a85..354d693 100644
+--- a/engine/shaders/el_chroma.glsl
++++ b/engine/shaders/el_chroma.glsl
+@@ -15,6 +15,8 @@ layout(constant_id = 13) const uint ELUP = 0;
+ // The device has subgroup quad operations in fragment shaders: el_vertical_quad
+ // shares the EL chroma rows across each 2 x 2 fragment quad.
+ layout(constant_id = 15) const uint QUAD = 0;
++// Input layout: 0 SAND128 P030, 1 linear NV15.
++layout(constant_id = 16) const uint NV15 = 0;
+ 
+ // ---- SAND reads ------------------------------------------------------------
+ // Every read stays in its row: a word is read only when it holds a sample
+@@ -38,14 +40,19 @@ uvec4 sand4(usamplerBuffer buf, uint base, uint colh, uint n, uint row)
+     uint a = word(buf, base, colh, w, row), b = word(buf, base, colh, w + 1u, row);
+     return uvec4(pick(a, b, sub), pick(a, b, sub + 1u), pick(a, b, sub + 2u), pick(a, b, sub + 3u));
+ }
+-uvec2 bl_chroma(uint cx, uint row) { return sand_even2(bl_c2, P.bl.y, P.bl.w, cx, row); }
++uvec2 bl_chroma(uint cx, uint row)
++{
++    return NV15 != 0u ? nv15_even2(bl_c, P.bl.y, P.bl.w, cx, row) : sand_even2(bl_c2, P.bl.y, P.bl.w, cx, row);
++}
+ 
+ // (Cb, Cr) of chroma column x and of x + 1 (clamped to the plane: the last
+ // column's pair is read with its left neighbour, in the plane)
+ uvec4 uvq(bool enh, uint x, uint row)
+ {
+     uint cw = enh ? P.el_size.x : P.size.z, n = 2u * min(x, cw - 2u);
+-    uvec4 q = enh ? sand4(el_c, P.el.y, P.el.w, n, row) : sand4(bl_c, P.bl.y, P.bl.w, n, row);
++    uvec4 q = NV15 != 0u
++        ? (enh ? nv15_4(el_c, P.el.y, P.el.w, n, row) : nv15_4(bl_c, P.bl.y, P.bl.w, n, row))
++        : (enh ? sand4(el_c, P.el.y, P.el.w, n, row) : sand4(bl_c, P.bl.y, P.bl.w, n, row));
+     return x + 1u < cw ? q : q.zwzw;
+ }
+ 
+diff --git a/engine/shaders/p1_chroma.frag b/engine/shaders/p1_chroma.frag
+index 466612a..8ad3af3 100644
+--- a/engine/shaders/p1_chroma.frag
++++ b/engine/shaders/p1_chroma.frag
+@@ -17,7 +17,6 @@
+ #include "piecewise.glsl"
+ #include "el_chroma.glsl"
+ 
+-layout(binding = 3) uniform usamplerBuffer bl_y;
+ layout(binding = 5) uniform usamplerBuffer el_y;
+ layout(binding = 10) uniform usamplerBuffer tables128;   // the tables as RGBA32UI
+ layout(binding = 12) uniform usampler2D el_cv;          // P0: the EL chroma's vertical filter (ELUP != 0)
+@@ -417,6 +416,12 @@ uvec2 mmr(uvec3 s0, uvec3 s1, bool both, ivec2 r)
+ // previous word's last sample (pixel 0 itself at cx 0).
+ uint guide_row(uint cx, uint y)
+ {
++    if (NV15 != 0u) {
++        uint p0 = cx != 0u ? nv15_sample(bl_y, P.bl.x, P.bl.z, 2u * cx - 1u, y)
++                           : nv15_sample(bl_y, P.bl.x, P.bl.z, 0u, y);
++        uvec2 p12 = nv15_even2(bl_y, P.bl.x, P.bl.z, cx, y);
++        return (p0 + 2u * p12.x + p12.y + 2u) >> 2;
++    }
+     uint m = div3(cx), s = cx - 3u * m, w = 2u * m;
+     uvec2 a = texelFetch(bl_y2, sand_index(P.bl.x, P.bl.z, w, y) >> 1).rg;
+     uint p0 = (s == 2u ? a.y : a.x) >> (s == 0u ? 0u : s == 1u ? 20u : 10u);   // 2cx
+@@ -467,7 +472,11 @@ uvec2 row422(uint cx, uint k, uint r)
+ // 2k+1 (odd) of the output: even -3 29 111 -9 over k-2 .. k+1, odd
+ // mirrored over k-1 .. k+2, / 128, floored at 0, rows clamped to the edge.
+ // Pass 2 takes the horizontal filter.
+-uint el_row(uint cx, int row) { return sand1(el_y, P.el.x, P.el.z, cx, uint(clamp(row, 0, int(P.size.w) - 1))); }
++uint el_row(uint cx, int row)
++{
++    uint r = uint(clamp(row, 0, int(P.size.w) - 1));
++    return NV15 != 0u ? nv15_sample(el_y, P.el.x, P.el.z, cx, r) : sand1(el_y, P.el.x, P.el.z, cx, r);
++}
+ uvec2 el_pair(uint cx, uint k)
+ {
+     int kk = int(k);
+@@ -490,7 +499,10 @@ void main()
+         o_chroma = uvec2(a.x | ((a.y & 15u) << 12), (a.y >> 4) | ((b.x & 255u) << 8));
+         o_el = uvec2((b.x >> 8) | (b.y << 4), 0u);
+     } else {
+-        o_el = PIECE != 0u ? uvec2(0u) : ELUP == 1u ? el_pair(cx, k) : uvec2(sand1(el_y, P.el.x, P.el.z, cx, k), 0u);
++        o_el = PIECE != 0u ? uvec2(0u)
++                           : ELUP == 1u ? el_pair(cx, k)
++                           : uvec2(NV15 != 0u ? nv15_sample(el_y, P.el.x, P.el.z, cx, k)
++                                              : sand1(el_y, P.el.x, P.el.z, cx, k), 0u);
+ 
+         // the luma guide: [1 2 1] / 4 on each of the block's rows (pixels
+         // 2cx-1 .. 2cx+1, the first clamped), rows averaged
+diff --git a/engine/shaders/p2_pack.frag b/engine/shaders/p2_pack.frag
+index 9e0279a..e53414c 100644
+--- a/engine/shaders/p2_pack.frag
++++ b/engine/shaders/p2_pack.frag
+@@ -52,6 +52,7 @@ layout(constant_id = 8) const uint OVERLAY = 0;
+ // INTERIOR: drawn only over blocks wholly inside the active area and below
+ // the rows the metadata packets reach, so neither is tested.
+ layout(constant_id = 9) const uint INTERIOR = 0;
++layout(constant_id = 10) const uint NV15 = 0;
+ layout(binding = 16) uniform sampler2D overlay_codes;   // PO: (Y, Cb, Cr) x alpha / 4096, alpha
+ 
+ uint packet_byte(uint i) { return (P.packets[i >> 4][(i >> 2) & 3u] >> (8u * (i & 3u))) & 255u; }
+@@ -62,6 +63,8 @@ uvec4 bl_block(uint px, uint y0)
+ {
+     if ((ABLATE & 8u) != 0u)
+         return uvec4(px, px + 1u, px + y0, px) & 1023u;
++    if (NV15 != 0u)
++        return uvec4(nv15_even2(bl_y, P.bl.x, P.bl.z, px, y0), nv15_even2(bl_y, P.bl.x, P.bl.z, px, y0 + 1u));
+     return uvec4(sand_even2(bl_y2, P.bl.x, P.bl.z, px, y0), sand_even2(bl_y2, P.bl.x, P.bl.z, px, y0 + 1u));
+ }
+ 

@@ -1,0 +1,112 @@
+From: Edward <edward@localhost>
+Subject: [PATCH] drm: dw-hdmi-qp VSI + Dolby Vision attach + VOP2 YUV DSP_BG fix
+
+diff -ruN a/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.c b/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.c
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.c	2026-11-21 13:02:22
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.c	2026-11-21 13:17:00
+@@ -1169,9 +1169,9 @@
+ 
+ static int dw_hdmi_qp_bridge_clear_hdmi_infoframe(struct drm_bridge *bridge)
+ {
+-	/* FIXME: add support for this InfoFrame */
++	struct dw_hdmi_qp *hdmi = bridge->driver_private;
+ 
+-	drm_warn_once(bridge->encoder->dev, "HDMI VSI not supported\n");
++	dw_hdmi_qp_mod(hdmi, 0, PKTSCHED_VSI_TX_EN, PKTSCHED_PKT_EN);
+ 
+ 	return 0;
+ }
+@@ -1211,9 +1211,38 @@
+ static int dw_hdmi_qp_bridge_write_hdmi_infoframe(struct drm_bridge *bridge,
+ 						  const u8 *buffer, size_t len)
+ {
++	struct dw_hdmi_qp *hdmi = bridge->driver_private;
++	u32 val, i, reg;
++
+ 	dw_hdmi_qp_bridge_clear_hdmi_infoframe(bridge);
+ 
+-	/* FIXME: add support for the HDMI VSI */
++	if (len < 4 || len > 31) {
++		dev_err(hdmi->dev, "invalid hdmi vsi infoframe len %zu\n", len);
++		return -EINVAL;
++	}
++
++	for (i = 0; i <= 7; i++)
++		dw_hdmi_qp_write(hdmi, 0, PKT_VSI_CONTENTS0 + i * 4);
++
++	val = (buffer[2] << 16) | (buffer[1] << 8) | buffer[0];
++	dw_hdmi_qp_write(hdmi, val, PKT_VSI_CONTENTS0);
++
++	reg = PKT_VSI_CONTENTS1;
++	for (i = 3; i < len; i++) {
++		if (i % 4 == 3)
++			val = buffer[i];
++		else
++			val |= buffer[i] << (((i - 3) % 4) * 8);
++
++		if (((i - 3) % 4 == 3) || i == (len - 1)) {
++			dw_hdmi_qp_write(hdmi, val, reg);
++			reg += 4;
++		}
++	}
++
++	dw_hdmi_qp_mod(hdmi, 0, PKTSCHED_VSI_FIELDRATE, PKTSCHED_PKT_CONFIG1);
++	dw_hdmi_qp_mod(hdmi, PKTSCHED_VSI_TX_EN, PKTSCHED_VSI_TX_EN,
++		       PKTSCHED_PKT_EN);
+ 
+ 	return 0;
+ }
+diff -ruN a/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.h b/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.h
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.h	2026-11-21 12:58:59
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.h	2026-11-21 13:17:00
+@@ -198,6 +198,7 @@
+ #define PKTSCHED_PRQUEUE2_CONFIG2			0xa94
+ #define PKTSCHED_PKT_CONFIG0				0xa98
+ #define PKTSCHED_PKT_CONFIG1				0xa9c
++#define PKTSCHED_VSI_FIELDRATE				BIT(14)
+ #define PKTSCHED_DRMI_FIELDRATE				BIT(13)
+ #define PKTSCHED_AVI_FIELDRATE				BIT(12)
+ #define PKTSCHED_PKT_CONFIG2				0xaa0
+@@ -206,6 +207,7 @@
+ #define PKTSCHED_DRMI_TX_EN				BIT(17)
+ #define PKTSCHED_AUDI_TX_EN				BIT(15)
+ #define PKTSCHED_AVI_TX_EN				BIT(13)
++#define PKTSCHED_VSI_TX_EN				BIT(12)
+ #define PKTSCHED_EMP_CVTEM_TX_EN			BIT(10)
+ #define PKTSCHED_AMD_TX_EN				BIT(8)
+ #define PKTSCHED_GCP_TX_EN				BIT(3)
+diff -ruN a/drivers/gpu/drm/drm_connector.c b/drivers/gpu/drm/drm_connector.c
+--- a/drivers/gpu/drm/drm_connector.c	2026-11-21 13:06:44
++++ b/drivers/gpu/drm/drm_connector.c	2026-11-21 13:17:00
+@@ -646,6 +646,10 @@
+ 
+         drm_connector_attach_colorspace_property(connector);
+ 
++	ret = drm_connector_attach_dolby_vision_property(connector);
++	if (ret)
++		return ret;
++
+ 	connector->hdmi.funcs = hdmi_funcs;
+ 
+ 	return 0;
+diff -ruN a/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c b/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c	2026-11-21 13:02:23
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c	2026-11-21 13:17:00
+@@ -1626,9 +1626,14 @@
+ 	 * Since performance is more important than accuracy here,
+ 	 * make use of the DRM_ARGB64_GET*_BPCS() helpers.
+ 	 */
+-	val = FIELD_PREP(RK3568_VP_DSP_BG__DSP_BG_RED, DRM_ARGB64_GETR_BPCS(bgcolor, 10));
+-	FIELD_MODIFY(RK3568_VP_DSP_BG__DSP_BG_GREEN, &val, DRM_ARGB64_GETG_BPCS(bgcolor, 10));
+-	FIELD_MODIFY(RK3568_VP_DSP_BG__DSP_BG_BLUE, &val, DRM_ARGB64_GETB_BPCS(bgcolor, 10));
++	if (is_yuv_output(to_rockchip_crtc_state(crtc->state)->bus_format) &&
++	    bgcolor == DRM_ARGB64(0xffff, 0, 0, 0)) {
++		val = 0x20010200;
++	} else {
++		val = FIELD_PREP(RK3568_VP_DSP_BG__DSP_BG_RED, DRM_ARGB64_GETR_BPCS(bgcolor, 10));
++		FIELD_MODIFY(RK3568_VP_DSP_BG__DSP_BG_GREEN, &val, DRM_ARGB64_GETG_BPCS(bgcolor, 10));
++		FIELD_MODIFY(RK3568_VP_DSP_BG__DSP_BG_BLUE, &val, DRM_ARGB64_GETB_BPCS(bgcolor, 10));
++	}
+ 	vop2_vp_write(vp, RK3568_VP_DSP_BG, val);
+ }
+ 
