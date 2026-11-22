@@ -1,0 +1,52 @@
+From: momokind <momokind@users.noreply.github.com>
+Subject: [PATCH] bench: fallback to renderD128/card0 and handle non-RPi DRM connector props
+
+On RK3588 LibreELEC, av_hwdevice_ctx_create(AV_HWDEVICE_TYPE_DRM, NULL, ...)
+returns -EFAULT whereas "/dev/dri/renderD128" succeeds. Also Rockchip HDMI
+connectors expose "color format" instead of "Broadcast RGB". Guard optional
+connector properties by prop_id != 0 and set "color format" to "RGB" during
+--kms-play (restoring "AUTO" on close).
+
+--- a/bench/source.c
++++ b/bench/source.c
+@@ -221,7 +221,10 @@ struct dv_source *dv_source_open(const char *path, const struct dv_source_option
+         s->el_present = cfg->el_present_flag && cfg->dv_profile == 7;
+     }
+     int hw = o->kind == DV_SOURCE_V4L2;
+-    if (hw && av_hwdevice_ctx_create(&s->device, AV_HWDEVICE_TYPE_DRM, NULL, NULL, 0) < 0) {
++    if (hw &&
++        av_hwdevice_ctx_create(&s->device, AV_HWDEVICE_TYPE_DRM, NULL, NULL, 0) < 0 &&
++        av_hwdevice_ctx_create(&s->device, AV_HWDEVICE_TYPE_DRM, "/dev/dri/renderD128", NULL, 0) < 0 &&
++        av_hwdevice_ctx_create(&s->device, AV_HWDEVICE_TYPE_DRM, "/dev/dri/card0", NULL, 0) < 0) {
+         fprintf(stderr, "source: no DRM hw device\n");
+         goto fail;
+     }
+--- a/bench/dvbench.c
++++ b/bench/dvbench.c
+@@ -1092,9 +1092,13 @@ static int kms_out_show(struct kms_out *k, const struct out_buf *o, int i, int f
+         drmModeAtomicAddProperty(r, k->crtc, prop_id(k->fd, k->crtc, C, "MODE_ID"), k->mode_blob);
+         drmModeAtomicAddProperty(r, k->crtc, prop_id(k->fd, k->crtc, C, "ACTIVE"), 1);
+         drmModeAtomicAddProperty(r, k->conn, prop_id(k->fd, k->conn, N, "CRTC_ID"), k->crtc);
+-        drmModeAtomicAddProperty(r, k->conn, prop_id(k->fd, k->conn, N, "Broadcast RGB"),
+-                                 enum_value(k->fd, k->conn, N, "Broadcast RGB", "Full"));
+-        drmModeAtomicAddProperty(r, k->conn, prop_id(k->fd, k->conn, N, "max bpc"), 8);
++        uint32_t p;
++        if ((p = prop_id(k->fd, k->conn, N, "Broadcast RGB")))
++            drmModeAtomicAddProperty(r, k->conn, p, enum_value(k->fd, k->conn, N, "Broadcast RGB", "Full"));
++        if ((p = prop_id(k->fd, k->conn, N, "color format")))
++            drmModeAtomicAddProperty(r, k->conn, p, enum_value(k->fd, k->conn, N, "color format", "RGB"));
++        if ((p = prop_id(k->fd, k->conn, N, "max bpc")))
++            drmModeAtomicAddProperty(r, k->conn, p, 8);
+         /* TV-led Dolby Vision signalling (patches/linux): DVBENCH_DV_VSIF=dolby
+          * for the Dolby VSIF, else the HDMI one */
+         const char *vsif = getenv("DVBENCH_DV_VSIF");
+@@ -1131,6 +1135,9 @@ static void kms_out_close(struct kms_out *k)
+         drmModeAtomicReq *r = drmModeAtomicAlloc();
+         drmModeAtomicAddProperty(r, k->conn, k->dv,
+                                  enum_value(k->fd, k->conn, DRM_MODE_OBJECT_CONNECTOR, "Dolby Vision", "Off"));
++        uint32_t cf = prop_id(k->fd, k->conn, DRM_MODE_OBJECT_CONNECTOR, "color format");
++        if (cf)
++            drmModeAtomicAddProperty(r, k->conn, cf, enum_value(k->fd, k->conn, DRM_MODE_OBJECT_CONNECTOR, "color format", "AUTO"));
+         if (drmModeAtomicCommit(k->fd, r, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL))
+             fprintf(stderr, "kms: Dolby Vision off: %s\n", strerror(errno));
+         drmModeAtomicFree(r);
