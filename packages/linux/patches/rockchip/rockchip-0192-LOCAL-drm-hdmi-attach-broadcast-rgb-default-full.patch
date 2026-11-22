@@ -1,0 +1,38 @@
+From: Edward <edward@localhost>
+Subject: [PATCH] drm: hdmi: attach Broadcast RGB property and default to Full range
+
+Rockchip VOP2 outputs full-range (0-255) RGB pixels without hardware
+full-to-limited RGB compression, while drm_hdmi_state_helper defaults
+Broadcast RGB to Automatic (setting is_limited_range=y and AVI Q1Q0=01
+for CEA modes), which causes displays with selectable quantization
+range (QS=1) to crush 0-16 blacks.
+
+Attach the "Broadcast RGB" connector property in drmm_connector_hdmi_init()
+and default hdmi.broadcast_rgb to DRM_HDMI_BROADCAST_RGB_FULL in
+__drm_atomic_helper_connector_hdmi_reset(). This also satisfies
+hdmi_dolby_vision_check()'s full-range RGB requirement without breaking
+YUV limited-range output.
+
+--- a/drivers/gpu/drm/drm_connector.c
++++ b/drivers/gpu/drm/drm_connector.c
+@@ -649,6 +649,10 @@
+ 	if (ret)
+ 		return ret;
+ 
++	ret = drm_connector_attach_broadcast_rgb_property(connector);
++	if (ret)
++		return ret;
++
+ 	connector->hdmi.funcs = hdmi_funcs;
+ 
+ 	return 0;
+--- a/drivers/gpu/drm/display/drm_hdmi_state_helper.c
++++ b/drivers/gpu/drm/display/drm_hdmi_state_helper.c
+@@ -323,6 +323,6 @@
+ 	new_conn_state->max_bpc = max_bpc;
+ 	new_conn_state->max_requested_bpc = max_bpc;
+-	new_conn_state->hdmi.broadcast_rgb = DRM_HDMI_BROADCAST_RGB_AUTO;
++	new_conn_state->hdmi.broadcast_rgb = DRM_HDMI_BROADCAST_RGB_FULL;
+ 	new_conn_state->hdmi.dolby_vision = DRM_HDMI_DOLBY_VISION_OFF;
+ }
+ EXPORT_SYMBOL(__drm_atomic_helper_connector_hdmi_reset);
