@@ -9,17 +9,23 @@ connector properties by prop_id != 0 and set "color format" to "RGB" during
 
 --- a/bench/source.c
 +++ b/bench/source.c
-@@ -221,7 +221,10 @@ struct dv_source *dv_source_open(const char *path, const struct dv_source_option
+@@ -221,7 +221,14 @@ struct dv_source *dv_source_open(const char *path, const struct dv_source_option
          s->el_present = cfg->el_present_flag && cfg->dv_profile == 7;
      }
      int hw = o->kind == DV_SOURCE_V4L2;
 -    if (hw && av_hwdevice_ctx_create(&s->device, AV_HWDEVICE_TYPE_DRM, NULL, NULL, 0) < 0) {
-+    if (hw &&
-+        av_hwdevice_ctx_create(&s->device, AV_HWDEVICE_TYPE_DRM, NULL, NULL, 0) < 0 &&
-+        av_hwdevice_ctx_create(&s->device, AV_HWDEVICE_TYPE_DRM, "/dev/dri/renderD128", NULL, 0) < 0 &&
-+        av_hwdevice_ctx_create(&s->device, AV_HWDEVICE_TYPE_DRM, "/dev/dri/card0", NULL, 0) < 0) {
-         fprintf(stderr, "source: no DRM hw device\n");
-         goto fail;
+-        fprintf(stderr, "source: no DRM hw device\n");
+-        goto fail;
++    if (hw) {
++        enum AVHWDeviceType v4l2_type = av_hwdevice_find_type_by_name("v4l2request");
++        if ((v4l2_type == AV_HWDEVICE_TYPE_NONE ||
++             av_hwdevice_ctx_create(&s->device, v4l2_type, NULL, NULL, 0) < 0) &&
++            av_hwdevice_ctx_create(&s->device, AV_HWDEVICE_TYPE_DRM, NULL, NULL, 0) < 0 &&
++            av_hwdevice_ctx_create(&s->device, AV_HWDEVICE_TYPE_DRM, "/dev/dri/renderD128", NULL, 0) < 0 &&
++            av_hwdevice_ctx_create(&s->device, AV_HWDEVICE_TYPE_DRM, "/dev/dri/card0", NULL, 0) < 0) {
++            fprintf(stderr, "source: no DRM/v4l2request hw device\n");
++            goto fail;
++        }
      }
 --- a/bench/dvbench.c
 +++ b/bench/dvbench.c
