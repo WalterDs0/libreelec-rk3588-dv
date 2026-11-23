@@ -1,0 +1,38 @@
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
+@@ -653,8 +653,24 @@
+   pi_frame frame{};
+   frame.bl = decoded->GetFrame();
+   const AVFrame* el = decoded->GetEnhancementLayer();
+-  if (el && !av_frame_get_side_data(frame.bl, AV_FRAME_DATA_DOVI_METADATA))
++  // (Hades) A picture takes the metadata that came with its enhancement picture: where the
++  // enhancement layer has Dolby Vision metadata, it is the one the picture is composed with (a
++  // two-track base layer may carry a placeholder of its own). The enhancement layer of a
++  // one-track stream carries none - the RPU is one of the base layer's units - so there the
++  // base layer's stays.
++  const bool elMetadata = el && av_frame_get_side_data(el, AV_FRAME_DATA_DOVI_METADATA);
++  if (elMetadata || (el && !av_frame_get_side_data(frame.bl, AV_FRAME_DATA_DOVI_METADATA)))
+     frame.rpu_frame = el;
++  if (!m_rpuLogged)
++  {
++    m_rpuLogged = true;
++    CLog::Log(LOGINFO,
++              "CDVTunnelDRMPRIME: the RPU comes from the {} frame (base layer metadata {}, "
++              "enhancement layer {})",
++              frame.rpu_frame ? "enhancement layer" : "base layer",
++              av_frame_get_side_data(frame.bl, AV_FRAME_DATA_DOVI_METADATA) ? "present" : "none",
++              elMetadata ? "present" : "none");
++  }
+   // MEL's residual is zero: the base layer alone renders the same
+   if (el && m_options.enhancementLayer &&
+       pi_frame_needs_el(frame.rpu_frame ? frame.rpu_frame : frame.bl) == 1)
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
+@@ -134,6 +134,7 @@
+   std::shared_ptr<CDVTunnelOutputPool> m_pool;
+   unsigned int m_failures = 0;
+   bool m_warnedEnhancementLayer = false;
++  bool m_rpuLogged = false; //!< the first frame's source of the RPU is in the log
+ 
+   //! what the last render did with an enhancement layer
+   enum class Layers

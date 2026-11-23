@@ -1,0 +1,68 @@
+--- a/engine/pi_engine.c
++++ b/engine/pi_engine.c
+@@ -3212,7 +3212,7 @@
+                     if (cv->num_pivots < 2 || cv->num_pivots > 9) { why = "num_pivots"; failed = 1; break; }
+                     for (int p = 0; p < cv->num_pivots && !failed; ++p) {
+                         if (cv->pivots[p] > 1023) { why = "pivots above 1023"; failed = 1; }
+-                        else if (p && cv->pivots[p] <= cv->pivots[p - 1]) { why = "pivots not ascending"; failed = 1; }
++                        else if (p && cv->pivots[p] < cv->pivots[p - 1]) { why = "pivots not ascending"; failed = 1; }
+                     }
+                 }
+             }
+--- a/engine/planner/dv_ffmpeg_metadata.c
++++ b/engine/planner/dv_ffmpeg_metadata.c
+@@ -132,7 +132,8 @@
+         if(curve->mapping_idc[0]!=AV_DOVI_MAPPING_POLYNOMIAL&&curve->mapping_idc[0]!=AV_DOVI_MAPPING_MMR)return DV_UNSUPPORTED;
+         dst->mapping=(uint32_t)curve->mapping_idc[0];
+         for(unsigned p=0;p<curve->num_pivots;++p){dst->pivots[p]=curve->pivots[p];
+-            if(curve->pivots[p]>1023||(p&&curve->pivots[p]<=curve->pivots[p-1]))return DV_INVALID;}
++            /* equal pivots: a piece of no width is never selected (some discs carry one) */
++            if(curve->pivots[p]>1023||(p&&curve->pivots[p]<curve->pivots[p-1]))return DV_INVALID;}
+         for(unsigned p=0;p+1u<curve->num_pivots;++p){
+             if(curve->mapping_idc[p]!=curve->mapping_idc[0])return DV_UNSUPPORTED;
+             if(!dst->mapping){if(curve->poly_order[p]>2)return DV_UNSUPPORTED;dst->polynomial_order[p]=curve->poly_order[p];
+--- a/engine/planner/pixel_luma.c
++++ b/engine/planner/pixel_luma.c
+@@ -36,7 +36,8 @@
+     if (c->mapping || c->pivot_count < 2 || c->pivot_count > 9 ||
+         c->nlq_offset > 1023) return -1;
+     for (unsigned i = 0; i < c->pivot_count; ++i)
+-        if (c->pivots[i] > 1023 || (i && c->pivots[i] <= c->pivots[i-1]))
++        /* equal pivots: a piece of no width is never selected */
++        if (c->pivots[i] > 1023 || (i && c->pivots[i] < c->pivots[i-1]))
+             return -1;
+     for (unsigned i = 0; i + 1 < c->pivot_count; ++i) {
+         if (c->polynomial_order[i] < 1 || c->polynomial_order[i] > 2) return -1;
+--- a/engine/planner/pixel_chroma_final.c
++++ b/engine/planner/pixel_chroma_final.c
+@@ -29,7 +29,7 @@
+         const dv_component_config *v = &c->component[i];
+         if (v->pivot_count < 2 || v->pivot_count > 9) return 0;
+         for (unsigned k = 0; k < v->pivot_count; ++k)
+-            if (v->pivots[k] > 1023 || (k && v->pivots[k] <= v->pivots[k-1])) return 0;
++            if (v->pivots[k] > 1023 || (k && v->pivots[k] < v->pivots[k-1])) return 0;
+     }
+     const dv_component_config *v = &c->component[component];
+     if (v->mapping != 1 || v->pivot_count != 2 || v->mmr_order < 1 ||
+--- a/engine/planner/single_reshape.c
++++ b/engine/planner/single_reshape.c
+@@ -8,7 +8,7 @@
+     for(unsigned c=0;c<3;++c){const dv_reshape_curve *v=&m->curve[c];
+         if(v->pivot_count<2||v->pivot_count>9)return 0;
+         for(unsigned p=0;p<v->pivot_count;++p)
+-            if(v->pivots[p]>limit||(p&&v->pivots[p]<=v->pivots[p-1]))return 0;
++            if(v->pivots[p]>limit||(p&&v->pivots[p]<v->pivots[p-1]))return 0;
+         for(unsigned p=0;p+1<v->pivot_count;++p){const dv_reshape_piece *s=&v->piece[p];
+             if(s->method>1||s->order<1||s->order>(s->method?3u:2u))return 0;}
+     }
+--- a/engine/planner/single_reshape_ffmpeg.c
++++ b/engine/planner/single_reshape_ffmpeg.c
+@@ -21,7 +21,7 @@
+         if(v->num_pivots<2||v->num_pivots>9)return -1;
+         dst->pivot_count=v->num_pivots;
+         for(unsigned p=0;p<v->num_pivots;++p){
+-            if(v->pivots[p]>maximum||(p&&v->pivots[p]<=v->pivots[p-1]))return -1;
++            if(v->pivots[p]>maximum||(p&&v->pivots[p]<v->pivots[p-1]))return -1;
+             dst->pivots[p]=v->pivots[p];}
+         for(unsigned p=0;p+1<v->num_pivots;++p){dv_reshape_piece *piece=&dst->piece[p];
+             switch(v->mapping_idc[p]){

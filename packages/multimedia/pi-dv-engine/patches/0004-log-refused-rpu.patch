@@ -1,0 +1,79 @@
+--- a/engine/pi_engine.c
++++ b/engine/pi_engine.c
+@@ -19,6 +19,7 @@
+ 
+ #include <errno.h>
+ #include <fcntl.h>
++#include <libavutil/dovi_meta.h>
+ #include <libavutil/hwcontext_drm.h>
+ #include <linux/sync_file.h>
+ #include <math.h>
+@@ -3176,6 +3177,68 @@
+                                        rpu ? rpu->size : 0, p);
+     }
+     if (st) {
++        /* once: what the planner was given, for a stream whose metadata it does not take */
++        if (!(e->warned & W_PLANNER) && dovi->size >= sizeof(AVDOVIMetadata)) {
++            const AVDOVIMetadata *md = (const AVDOVIMetadata *)dovi->data;
++            const AVDOVIRpuDataHeader *h = av_dovi_get_header(md);
++            const AVDOVIDataMapping *mp = av_dovi_get_mapping(md);
++            const AVFrameSideData *blD = av_frame_get_side_data(f->bl, AV_FRAME_DATA_DOVI_METADATA);
++            const AVFrameSideData *elD = f->el ? av_frame_get_side_data(f->el, AV_FRAME_DATA_DOVI_METADATA) : NULL;
++            /* the settings checks the planner makes, in its order, to name the one that fails */
++            const char *why = "none (the plan's own checks then)";
++            char pivots[160];
++            int used = 0;
++            for (int c = 0; c < 3; ++c) {
++                const AVDOVIReshapingCurve *cv = &mp->curves[c];
++                used += snprintf(pivots + used, sizeof(pivots) - used, "%sc%d:", c ? " " : "", c);
++                for (int p = 0; p < cv->num_pivots && p < 9 && used < (int)sizeof(pivots); ++p)
++                    used += snprintf(pivots + used, sizeof(pivots) - used, "%s%u", p ? "," : "", cv->pivots[p]);
++            }
++            if (h->coef_data_type != 0) why = "coef_data_type";
++            else if (h->coef_log2_denom > 32) why = "coef_log2_denom";
++            else if (h->bl_bit_depth != 10) why = "bl_bit_depth";
++            else if (h->el_bit_depth != 10) why = "el_bit_depth";
++            else if (h->vdr_bit_depth != 12) why = "vdr_bit_depth";
++            else if (h->disable_residual_flag > 1) why = "disable_residual_flag";
++            else if (h->el_spatial_resampling_filter_flag > 1) why = "el_spatial_resampling_filter_flag";
++            else if (h->bl_video_full_range_flag > 1) why = "bl_video_full_range_flag";
++            else if (h->chroma_resampling_explicit_filter_flag) why = "chroma_resampling_explicit_filter_flag";
++            else if (mp->mapping_color_space) why = "mapping_color_space";
++            else if (mp->mapping_chroma_format_idc) why = "mapping_chroma_format_idc";
++            else {
++                int failed = 0;
++                for (int c = 0; c < 3 && !failed; ++c) {
++                    const AVDOVIReshapingCurve *cv = &mp->curves[c];
++                    if (cv->num_pivots < 2 || cv->num_pivots > 9) { why = "num_pivots"; failed = 1; break; }
++                    for (int p = 0; p < cv->num_pivots && !failed; ++p) {
++                        if (cv->pivots[p] > 1023) { why = "pivots above 1023"; failed = 1; }
++                        else if (p && cv->pivots[p] <= cv->pivots[p - 1]) { why = "pivots not ascending"; failed = 1; }
++                    }
++                }
++            }
++            logf_(e, PI_LOG_WARNING,
++                  "the RPU the planner refuses: from %s (%s), base layer %ux%u metadata %s, "
++                  "enhancement layer %s metadata %s; metadata %zu B (%d ext blocks of %zu B), "
++                  "raw RPU %s; bl_bit_depth %u, el_bit_depth %u, vdr_bit_depth %u, coef_data_type %u, "
++                  "coef_log2_denom %u, residual %u, el_resampling %u, bl_full_range %u, "
++                  "explicit_filter %u, mapping color space %u chroma format %u, ext_mapping %u/%u; "
++                  "fails: %s; pivots %s",
++                  meta == f->el ? "the enhancement layer" : "the base layer",
++                  f->rpu_frame ? "rpu_frame" : "no rpu_frame",
++                  (unsigned)f->bl->width, (unsigned)f->bl->height, blD ? "present" : "none",
++                  f->el ? "present" : "none", elD ? "present" : "none",
++                  dovi->size, md->num_ext_blocks, md->ext_block_size,
++                  rpu ? "present" : "none",
++                  (unsigned)h->bl_bit_depth, (unsigned)h->el_bit_depth, (unsigned)h->vdr_bit_depth,
++                  (unsigned)h->coef_data_type, (unsigned)h->coef_log2_denom,
++                  (unsigned)h->disable_residual_flag,
++                  (unsigned)h->el_spatial_resampling_filter_flag,
++                  (unsigned)h->bl_video_full_range_flag,
++                  (unsigned)h->chroma_resampling_explicit_filter_flag,
++                  (unsigned)mp->mapping_color_space, (unsigned)mp->mapping_chroma_format_idc,
++                  (unsigned)h->ext_mapping_idc_0_4, (unsigned)h->ext_mapping_idc_5_7,
++                  why, pivots);
++        }
+         WARN_ONCE(e, W_PLANNER, "the planner refuses the frame: dv_status %d", st);
+         rc = st == -1 ? PI_E_BAD_RPU : PI_E_UNSUPPORTED_PLAN;
+         goto out;
