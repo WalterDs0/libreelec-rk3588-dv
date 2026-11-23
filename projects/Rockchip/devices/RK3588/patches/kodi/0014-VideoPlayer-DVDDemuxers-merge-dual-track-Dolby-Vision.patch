@@ -1,0 +1,2733 @@
+From: momokind <momokind2002@gmail.com>
+Subject: [PATCH] VideoPlayer: DVDDemuxers: merge dual-track Dolby Vision (Blu-ray ISO/M2TS, MKV, MP4)
+
+Port CDVLayerMerge from LibreELEC-Hades (including the Blu-ray transport
+stream PID 0x1011/0x1015 pairing without PMT HDMV registration descriptor)
+to join dual-track Dolby Vision Profile 7 streams into single-track packets
+with HAVE_PIDV / ENABLE_PIDV.
+
+diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/CMakeLists.txt b/xbmc/cores/VideoPlayer/DVDDemuxers/CMakeLists.txt
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/CMakeLists.txt	2026-11-10 06:45:49
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/CMakeLists.txt	2026-11-23 11:53:23
+@@ -33,4 +33,13 @@
+             DVDDemuxVobsub.h
+             DVDFactoryDemuxer.h)
+ 
++if(ENABLE_DVBRIDGE)
++  list(APPEND SOURCES DVLayerMerge.cpp)
++  list(APPEND HEADERS DVLayerMerge.h)
++endif()
++
+ core_add_library(dvddemuxers)
++if(ENABLE_DVBRIDGE)
++  # the probe of the RPU of a stream (dvbridge_probe.h)
++  target_link_libraries(${CORE_LIBRARY} PRIVATE dvbridge_core)
++endif()
+diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp	2026-11-10 06:45:49
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp	2026-11-23 11:53:23
+@@ -58,6 +58,9 @@
+ #include <libavutil/pixdesc.h>
+ }
+ 
++#ifdef HAVE_PIDV
++#endif
++
+ using namespace KODI::UTILS;
+ using namespace std::chrono_literals;
+ 
+@@ -724,6 +727,17 @@
+ {
+   m_pkt.result = -1;
+   av_packet_unref(&m_pkt.pkt);
++#ifdef HAVE_PIDV
++  ReportDVLayers();
++  m_dvMerge.Restart();
++  m_dvOffsetLines = 0;
++  m_dvBaseIndex = -1;
++  m_dvEnhancementIndex = -1;
++  m_dvVerified = true;
++  m_dvProbed.clear();
++  m_dvPromoted.clear();
++  m_dvNotJoined.clear();
++#endif
+ 
+   if (m_pFormatContext)
+   {
+@@ -770,6 +784,9 @@
+ 
+   m_pkt.result = -1;
+   av_packet_unref(&m_pkt.pkt);
++#ifdef HAVE_PIDV
++  m_dvMerge.Clear();
++#endif
+ 
+   m_displayTime = 0;
+   m_dtsAtDisplayTime = DVD_NOPTS_VALUE;
+@@ -1075,6 +1092,363 @@
+   return timestamp * DVD_TIME_BASE;
+ }
+ 
++#ifdef HAVE_PIDV
++// Dolby Vision profile 7 can come in two video tracks, which libavformat puts in a stream group:
++// the transport stream of a UHD Blu-ray, Matroska files that keep its two tracks, and MP4 files
++// with the dual-track carriage of Dolby's specification. Without this the player opens
++// the first one, the base layer, and plays HDR10. Called while the streams are made, when the
++// program that plays is known and before its streams are added.
++void CDVDDemuxFFmpeg::FindDVLayers()
++{
++  using Result = CDVLayerMerge::Layers::Result;
++  using Container = CDVLayerMerge::Container;
++  const CDVLayerMerge::Layers layers = CDVLayerMerge::Find(m_pFormatContext, m_program);
++
++  if (layers.result == Result::FRAMING)
++    CLog::Log(LOGINFO,
++              "CDVDDemuxFFmpeg: Dolby Vision profile 7 in two video tracks (streams {} and {}) "
++              "whose units are not framed as the container frames them (a length of {} and of {} "
++              "bytes before each unit, 0 for start codes; a transport stream has start codes, MP4 "
++              "and Matroska lengths): not joined, the base layer plays alone",
++              layers.base, layers.enhancement, layers.baseLengthSize,
++              layers.enhancementLengthSize);
++  else if (layers.result == Result::WRONG_SIZE)
++  {
++    // (Hades: two tracks of the same size are two whole pictures: CDVLayerMerge::WrongSizeReason())
++    const AVCodecParameters* b = m_pFormatContext->streams[layers.base]->codecpar;
++    const AVCodecParameters* e = m_pFormatContext->streams[layers.enhancement]->codecpar;
++    CLog::Log(LOGINFO, "{}",
++              CDVLayerMerge::WrongSizeReason(layers.base, layers.enhancement, b->width, b->height,
++                                             e->width, e->height));
++  }
++  else if (layers.result == Result::NONE)
++    LogDVNotJoined(layers.reason);
++
++  const bool joined = layers.result == Result::JOINED;
++  const int base = joined ? layers.base : -1;
++  const int enhancement = joined ? layers.enhancement : -1;
++
++  // the same pair as before (the streams are made again, a program change): what waits stays
++  if (base == m_dvBaseIndex && enhancement == m_dvEnhancementIndex)
++  {
++    if (joined)
++    {
++      // more may be known of it by now (the size, the frame rate)
++      m_dvRecord = layers.record;
++      m_dvMerge.Configure(layers);
++    }
++    return;
++  }
++
++  ReportDVLayers();
++  m_dvMerge.Restart();
++  m_dvOffsetLines = 0;
++  m_dvBaseIndex = base;
++  m_dvEnhancementIndex = enhancement;
++  m_dvRecord = layers.record;
++  m_dvVerified = !joined || layers.verified;
++  if (!joined)
++    return;
++
++  m_dvMerge.Configure(layers);
++  if (!layers.verified)
++  {
++    CLog::Log(LOGINFO,
++              "CDVDDemuxFFmpeg: two HEVC tracks of Matroska that nothing groups, stream {} of "
++              "the size of a Dolby Vision enhancement layer for stream {} ({}): a Dolby Vision "
++              "pair only if the first packets of stream {} have an RPU and the ones of stream {} "
++              "none",
++              enhancement, base,
++              layers.described ? "a Dolby Vision record on the second one only"
++                               : "no Dolby Vision record",
++              enhancement, base);
++    return;
++  }
++  const char* how = "a Blu-ray stream, by its stream numbers";
++  if (layers.container == Container::MP4)
++    how = "MP4, by the reference and the Dolby Vision record of the enhancement track; units "
++          "with their lengths";
++  else if (layers.container == Container::MATROSKA)
++    how = "Matroska, by the Dolby Vision record of the enhancement track; units with their "
++          "lengths, decoding times made from the presentation times";
++  else if (layers.described)
++    how = "Dolby Vision descriptor";
++  CLog::Log(LOGINFO,
++            "CDVDDemuxFFmpeg: Dolby Vision profile 7 in two video tracks ({}): the enhancement "
++            "layer and the RPU of stream {} are joined to the base layer of stream {}",
++            how, enhancement, base);
++}
++
++// After the streams are made: the enhancement layer is no stream of the player, but its packets
++// are needed.
++void CDVDDemuxFFmpeg::KeepDVLayers()
++{
++  if (m_dvBaseIndex < 0)
++    return;
++
++  if (!GetStream(m_dvBaseIndex))
++  {
++    // the base layer did not become a stream of the player
++    m_dvMerge.Clear();
++    m_dvBaseIndex = -1;
++    m_dvEnhancementIndex = -1;
++    return;
++  }
++  m_pFormatContext->streams[m_dvEnhancementIndex]->discard = AVDISCARD_NONE;
++}
++
++void CDVDDemuxFFmpeg::CheckDVLayers()
++{
++  using Verification = CDVLayerMerge::Verification;
++  if (m_dvBaseIndex < 0 || m_dvVerified)
++    return;
++
++  const Verification verification = m_dvMerge.GetVerification();
++  if (verification == Verification::VERIFIED)
++  {
++    m_dvVerified = true;
++    CLog::Log(LOGINFO,
++              "CDVDDemuxFFmpeg: stream {} has the RPUs of a Dolby Vision enhancement layer and "
++              "stream {} none: they are a pair, and stream {} is Dolby Vision profile 7 from "
++              "here on",
++              m_dvEnhancementIndex, m_dvBaseIndex, m_dvBaseIndex);
++    if (CDemuxStream* stream = GetStream(m_dvBaseIndex))
++      PromoteDolbyVision(stream, m_dvRecord,
++                         m_pFormatContext->streams[m_dvEnhancementIndex]->codecpar);
++  }
++  else if (verification == Verification::REFUSED)
++  {
++    if (m_dvEnhancementIndex >= 0)
++      CLog::Log(LOGINFO,
++                "CDVDDemuxFFmpeg: streams {} and {} are no Dolby Vision pair (no RPU in the "
++                "first packets of the second, or one in those of the first): two streams, as "
++                "they were",
++                m_dvBaseIndex, m_dvEnhancementIndex);
++    // the second track becomes a stream with its next packet (AddStream())
++    m_dvEnhancementIndex = -1;
++    // what waited goes out first
++    if (m_dvMerge.Empty())
++      m_dvBaseIndex = -1;
++  }
++}
++
++void CDVDDemuxFFmpeg::PromoteDolbyVision(CDemuxStream* stream,
++                                        const AVDOVIDecoderConfigurationRecord& record,
++                                        const AVCodecParameters* enhancement)
++{
++  auto* video = dynamic_cast<CDemuxStreamVideo*>(stream);
++  if (!video)
++    return;
++  video->hdr_type = StreamHdrType::HDR_TYPE_DOLBYVISION;
++  video->dovi = record;
++  if (enhancement &&
++      CDVLayerMerge::IsConfigurationRecord(enhancement->extradata, enhancement->extradata_size))
++    video->doviELConfig = FFmpegExtraData(enhancement->extradata, enhancement->extradata_size);
++  // VideoPlayer opens the codec of the stream again with what it is now (CheckStreamChanges())
++  video->changes++;
++}
++
++void CDVDDemuxFFmpeg::LogDVNotJoined(const char* reason)
++{
++  if (!reason || !*reason)
++    return;
++  unsigned int hevc = 0;
++  for (unsigned int i = 0; i < m_pFormatContext->nb_streams; ++i)
++  {
++    const AVCodecParameters* par = m_pFormatContext->streams[i]->codecpar;
++    hevc += par->codec_type == AVMEDIA_TYPE_VIDEO && par->codec_id == AV_CODEC_ID_HEVC &&
++            !(m_pFormatContext->streams[i]->disposition & AV_DISPOSITION_ATTACHED_PIC);
++  }
++  bool group = false;
++  for (unsigned int i = 0; i < m_pFormatContext->nb_stream_groups; ++i)
++    group |= m_pFormatContext->stream_groups[i] &&
++             m_pFormatContext->stream_groups[i]->type == AV_STREAM_GROUP_PARAMS_DOLBY_VISION;
++  if (hevc < 2 && !group)
++    return;
++
++  // each track that may be a layer: HEVC video, one with a Dolby Vision record, one of a group
++  const bool ts = strcmp(m_pFormatContext->iformat->name, "mpegts") == 0;
++  std::string tracks;
++  for (unsigned int i = 0; i < m_pFormatContext->nb_streams; ++i)
++  {
++    const AVStream* st = m_pFormatContext->streams[i];
++    const AVCodecParameters* par = st->codecpar;
++    const AVPacketSideData* sd =
++        av_packet_side_data_get(par->coded_side_data, par->nb_coded_side_data,
++                                AV_PKT_DATA_DOVI_CONF);
++    const auto* record = sd && sd->size >= sizeof(AVDOVIDecoderConfigurationRecord)
++                             ? reinterpret_cast<const AVDOVIDecoderConfigurationRecord*>(sd->data)
++                             : nullptr;
++    bool inGroup = false;
++    for (unsigned int g = 0; g < m_pFormatContext->nb_stream_groups; ++g)
++    {
++      const AVStreamGroup* sg = m_pFormatContext->stream_groups[g];
++      if (sg && sg->type == AV_STREAM_GROUP_PARAMS_DOLBY_VISION)
++        for (unsigned int j = 0; j < sg->nb_streams; ++j)
++          inGroup |= sg->streams[j] == st;
++    }
++    const bool video = par->codec_type == AVMEDIA_TYPE_VIDEO && par->codec_id == AV_CODEC_ID_HEVC;
++    if (!video && !record && !inGroup)
++      continue;
++    char tag[AV_FOURCC_MAX_STRING_SIZE] = {};
++    av_fourcc_make_string(tag, par->codec_tag);
++    const int lengthSize = CDVLayerMerge::LengthSize(par);
++    std::string line = StringUtils::Format(
++        "{}stream {} ({} {}): {} {}, {}x{}, tag {}, {}", tracks.empty() ? "" : "; ", i,
++        ts ? "PID" : "track", ts ? StringUtils::Format("0x{:x}", st->id) : std::to_string(st->id),
++        av_get_media_type_string(par->codec_type) ? av_get_media_type_string(par->codec_type)
++                                                  : "unknown",
++        avcodec_get_name(par->codec_id), par->width, par->height, tag,
++        lengthSize ? StringUtils::Format("units with {}-byte lengths", lengthSize)
++                   : std::string("start codes"));
++    if (record)
++      line += StringUtils::Format(", Dolby Vision record: profile {} level {}, RPU {}, enhancement "
++                                  "layer {}, base layer {}, compatibility {}",
++                                  record->dv_profile, record->dv_level, record->rpu_present_flag,
++                                  record->el_present_flag, record->bl_present_flag,
++                                  record->dv_bl_signal_compatibility_id);
++    else
++      line += ", no Dolby Vision record";
++    if (inGroup)
++      line += ", in a Dolby Vision group of libavformat";
++    if (st->disposition & AV_DISPOSITION_ATTACHED_PIC)
++      line += ", an attached picture";
++    tracks += line;
++  }
++  const std::string message = StringUtils::Format(
++      "CDVDDemuxFFmpeg: video tracks not joined as Dolby Vision in two tracks ({}): {}", reason,
++      tracks);
++  if (message == m_dvNotJoined)
++    return;
++  m_dvNotJoined = message;
++  CLog::Log(LOGINFO, "{}", message);
++}
++
++// A HEVC stream that no Dolby Vision record declares, and whose first packets bring an RPU: the
++// RPU says what it is (CDVLayerMerge::RecordFromRpu()), and only what can be told for sure makes
++// it Dolby Vision. A stream without one stays as it is: nothing of it changes.
++void CDVDDemuxFFmpeg::ProbeDolbyVision(CDemuxStream* stream,
++                                       int streamIdx,
++                                       const uint8_t* data,
++                                       int size)
++{
++  // the packets of a stream that are looked at
++  static constexpr unsigned int PROBED_PACKETS = 48;
++
++  if (!stream || stream->type != StreamType::VIDEO || stream->codec != AV_CODEC_ID_HEVC ||
++      streamIdx == m_dvBaseIndex || streamIdx == m_dvEnhancementIndex || !data || size <= 0)
++    return;
++  unsigned int& probed = m_dvProbed[streamIdx];
++  if (probed >= PROBED_PACKETS)
++    return;
++  auto* video = static_cast<CDemuxStreamVideo*>(stream);
++  if (video->hdr_type == StreamHdrType::HDR_TYPE_DOLBYVISION || video->dovi.dv_profile)
++  {
++    probed = PROBED_PACKETS;
++    return;
++  }
++  ++probed;
++
++  const AVStream* avStream = m_pFormatContext->streams[streamIdx];
++  CDVLayerMerge::RpuProbe probe;
++  CDVLayerMerge::ProbeRpu(data, static_cast<size_t>(size),
++                            CDVLayerMerge::LengthSize(avStream->codecpar), &probe);
++  if (!probe.rpu)
++    return;
++  probed = PROBED_PACKETS;
++
++  AVRational rate = av_guess_frame_rate(m_pFormatContext, const_cast<AVStream*>(avStream), nullptr);
++  AVDOVIDecoderConfigurationRecord record{};
++  if (!CDVLayerMerge::RecordFromRpu(probe, avStream->codecpar, rate, record))
++  {
++    CLog::Log(LOGINFO,
++              "CDVDDemuxFFmpeg: stream {} has Dolby Vision RPUs but no Dolby Vision record, and "
++              "they do not say for sure what it is (RPU profile {}, {} enhancement layer, a "
++              "guess of profile {}): it plays as it is",
++              streamIdx, probe.rpu_profile, probe.layer ? "with an" : "no", probe.profile);
++    return;
++  }
++  CLog::Log(LOGINFO,
++            "CDVDDemuxFFmpeg: stream {} has Dolby Vision RPUs but no Dolby Vision record: it is "
++            "Dolby Vision profile {} ({} enhancement layer, base layer compatibility {}) from "
++            "here on",
++            streamIdx, record.dv_profile, record.el_present_flag ? "with an" : "no",
++            record.dv_bl_signal_compatibility_id);
++  m_dvPromoted[streamIdx] = record;
++  PromoteDolbyVision(stream, record, nullptr);
++}
++
++void CDVDDemuxFFmpeg::ReportDVLayers()
++{
++  const CDVLayerMerge::Counts& counts = m_dvMerge.GetCounts();
++  if (counts.joined + counts.alone == m_dvReported)
++    return;
++
++  m_dvReported = counts.joined + counts.alone;
++  // (Hades: the offset of the decoding times of the two tracks, where one was learned or tried)
++  std::string offset;
++  if ((counts.offsets || counts.unconfirmed) && m_pFormatContext && m_dvBaseIndex >= 0 &&
++      static_cast<unsigned int>(m_dvBaseIndex) < m_pFormatContext->nb_streams)
++    offset = StringUtils::Format(
++        "; the decoding times of the enhancement track are paired {:.3f} ms off those of the base "
++        "track ({} offsets learned; {} random-access pictures of both layers at the same time "
++        "were followed by pictures in another order, and taught nothing)",
++        counts.offset * av_q2d(m_pFormatContext->streams[m_dvBaseIndex]->time_base) * 1000,
++        counts.offsets, counts.unconfirmed);
++  CLog::Log(LOGINFO,
++            "CDVDDemuxFFmpeg: Dolby Vision in two tracks so far: {} access units joined and {} "
++            "without their enhancement layer; {} enhancement packets had no base packet ({} of "
++            "them before the first access unit joined after the start or a seek) and {} were not "
++            "unit streams; at most {} base and {} enhancement packets waited for the other layer; "
++            "the time of {} enhancement access units could not be used (they are presented "
++            "before the start time of the file){}",
++            counts.joined, counts.alone, counts.dropped, counts.droppedFirst, counts.malformed,
++            counts.waited, counts.queued, counts.unusable, offset);
++}
++
++void CDVDDemuxFFmpeg::TellDVOffset()
++{
++  const CDVLayerMerge::Counts& counts = m_dvMerge.GetCounts();
++  m_dvOffsetsTold = counts.offsets;
++  if (m_dvOffsetLines >= 4 || (counts.offset == 0 && m_dvOffsetLines == 0) ||
++      m_dvBaseIndex < 0 || static_cast<unsigned int>(m_dvBaseIndex) >= m_pFormatContext->nb_streams)
++    return;
++  ++m_dvOffsetLines;
++  const double ms =
++      counts.offset * av_q2d(m_pFormatContext->streams[m_dvBaseIndex]->time_base) * 1000;
++  CLog::Log(LOGINFO,
++            "CDVDDemuxFFmpeg: Dolby Vision in two tracks: the decoding times of the enhancement "
++            "track (stream {}) are {:.3f} ms {} those of the base track (stream {}), with the "
++            "same pictures in the same order (a random-access picture of both layers presented "
++            "at the same time, and the {} access units after it): its packets pair by their "
++            "decoding time less that{}",
++            m_dvEnhancementIndex, ms < 0 ? -ms : ms, ms < 0 ? "before" : "after", m_dvBaseIndex,
++            CDVLayerMerge::CONFIRM, m_dvOffsetLines == 4 ? " (not told again for this pair)" : "");
++}
++#endif
++
++int CDVDDemuxFFmpeg::ReadFrame(AVPacket* packet)
++{
++#ifdef HAVE_PIDV
++  if (m_dvBaseIndex >= 0)
++  {
++    // access units after which the log gets its first line about the join
++    static constexpr uint64_t FIRST_REPORT = 600;
++
++    const int result =
++        m_dvMerge.Read(m_pFormatContext, m_dvBaseIndex, m_dvEnhancementIndex, packet);
++    const CDVLayerMerge::Counts& counts = m_dvMerge.GetCounts();
++    if (!m_dvReported && counts.joined + counts.alone >= FIRST_REPORT)
++      ReportDVLayers();
++    if (counts.offsets != m_dvOffsetsTold)
++      TellDVOffset();
++    CheckDVLayers();
++    return result;
++  }
++#endif
++  return av_read_frame(m_pFormatContext, packet);
++}
++
+ DemuxPacket* CDVDDemuxFFmpeg::ReadInternal(bool keep)
+ {
+   DemuxPacket* pPacket = NULL;
+@@ -1098,8 +1472,11 @@
+ 
+         // timeout reads after 100ms
+         m_timeout.Set(20s);
+-        m_pkt.result = av_read_frame(m_pFormatContext, &m_pkt.pkt);
++        m_pkt.result = ReadFrame(&m_pkt.pkt);
+         m_timeout.SetInfinite();
++#ifdef HAVE_PIDV
++        m_dvLayerChecked = false;
++#endif
+       }
+ 
+       if (m_pkt.result == AVERROR(EINTR) || m_pkt.result == AVERROR(EAGAIN))
+@@ -1201,6 +1578,23 @@
+           pPacket->duration = DVD_SEC_TO_TIME((double)m_pkt.pkt.duration * stream->time_base.num /
+                                               stream->time_base.den);
+ 
++#ifdef HAVE_PIDV
++          // A packet of two joined tracks says when its enhancement access unit is presented by
++          // the difference to its own time, which is the difference between the two times made
++          // here only where ConvertTimestamp() moves both alike: not across the start time,
++          // where the difference is set right, or left out when no time names the picture.
++          // Once for each packet: the one that a seek keeps comes here again with the next read.
++          if (m_pkt.pkt.stream_index == m_dvBaseIndex && !m_dvLayerChecked)
++          {
++            m_dvLayerChecked = true;
++            m_dvMerge.CheckLayerTime(&m_pkt.pkt,
++                                     [this, stream](int64_t pts)
++                                     {
++                                       return ConvertTimestamp(pts, stream->time_base.den,
++                                                               stream->time_base.num);
++                                     });
++          }
++#endif
+           CDVDDemuxUtils::StoreSideData(pPacket, &m_pkt.pkt);
+ 
+           CDVDInputStream::IDisplayTime* inputStream = m_pInput->GetIDisplayTime();
+@@ -1284,6 +1678,9 @@
+       if (stream && stream->codec == AV_CODEC_ID_H264)
+         pPacket->recoveryPoint = m_seekToKeyFrame;
+       m_seekToKeyFrame = false;
++#ifdef HAVE_PIDV
++      ProbeDolbyVision(stream, pPacket->iStreamId, pPacket->pData, pPacket->iSize);
++#endif
+     }
+     if (!stream)
+     {
+@@ -1318,6 +1715,9 @@
+ 
+   m_pkt.result = -1;
+   av_packet_unref(&m_pkt.pkt);
++#ifdef HAVE_PIDV
++  m_dvMerge.Clear();
++#endif
+ 
+   CDVDInputStream::IPosTime* ist = m_pInput->GetIPosTime();
+   if (ist)
+@@ -1412,6 +1812,10 @@
+     else
+       ret = av_seek_frame(m_pFormatContext, m_seekStream, seek_pts,
+                           backwards ? AVSEEK_FLAG_BACKWARD : 0);
++#ifdef HAVE_PIDV
++    // what was read above, while the transport stream was not ready, is from before the seek
++    m_dvMerge.Clear();
++#endif
+ 
+     if (ret < 0)
+     {
+@@ -1486,6 +1890,9 @@
+ 
+   m_pkt.result = -1;
+   av_packet_unref(&m_pkt.pkt);
++#ifdef HAVE_PIDV
++  m_dvMerge.Clear();
++#endif
+ 
+   return (ret >= 0);
+ }
+@@ -1651,6 +2058,9 @@
+     if (m_program != UINT_MAX)
+     {
+       m_pFormatContext->programs[m_program]->discard = AVDISCARD_NONE;
++#ifdef HAVE_PIDV
++      FindDVLayers();
++#endif
+ 
+       // add streams from selected program
+       for (unsigned int i = 0; i < m_pFormatContext->programs[m_program]->nb_stream_indexes; i++)
+@@ -1675,9 +2085,15 @@
+   // if there were no programs or they were all empty, add all streams
+   if (m_program == UINT_MAX)
+   {
++#ifdef HAVE_PIDV
++    FindDVLayers();
++#endif
+     for (unsigned int i = 0; i < m_pFormatContext->nb_streams; i++)
+       addStreamKeepingChanges(static_cast<int>(i));
+   }
++#ifdef HAVE_PIDV
++  KeepDVLayers();
++#endif
+ }
+ 
+ void CDVDDemuxFFmpeg::SaveProbedStreamParameters()
+@@ -1823,6 +2239,12 @@
+ CDemuxStream* CDVDDemuxFFmpeg::AddStream(int streamIdx)
+ {
+   AVStream* pStream = m_pFormatContext->streams[streamIdx];
++#ifdef HAVE_PIDV
++  // The enhancement layer of a Dolby Vision stream in two tracks is no stream of its own for the
++  // player: it is joined to the base layer while reading (see ReadFrame()).
++  if (streamIdx == m_dvEnhancementIndex)
++    return nullptr;
++#endif
+   if (pStream && pStream->discard != AVDISCARD_ALL)
+   {
+     // Video (mp4) from GoPro cameras can have a 'meta' track used for a file repair containing
+@@ -1988,6 +2410,31 @@
+           st->masteringMetaData = std::make_shared<AVMasteringDisplayMetadata>(
+               *reinterpret_cast<const AVMasteringDisplayMetadata*>(sideData->data));
+         }
++#ifdef HAVE_PIDV
++        // made Dolby Vision by its RPUs (ProbeDolbyVision()), and made again
++        if (const auto promoted = m_dvPromoted.find(streamIdx); promoted != m_dvPromoted.end())
++        {
++          st->hdr_type = StreamHdrType::HDR_TYPE_DOLBYVISION;
++          st->dovi = promoted->second;
++        }
++        // (an unverified pair is no Dolby Vision stream until its packets show it: CheckDVLayers())
++        if (streamIdx == m_dvBaseIndex && m_dvVerified)
++        {
++          // The base layer of a Dolby Vision stream in two tracks carries no Dolby Vision record
++          // of its own. For the player it is the stream of the one-track form that ReadFrame()
++          // makes of the two tracks.
++          st->hdr_type = StreamHdrType::HDR_TYPE_DOLBYVISION;
++          st->dovi = m_dvRecord;
++          // In MP4 and Matroska the parameter sets of the enhancement layer are in the hvcC record
++          // of its track, and may be nowhere else ('dvh1'): its decoder takes that record, as it
++          // takes the one of the enhancement layer of a one-track MP4 file. A transport stream has
++          // them in the stream and no record.
++          const AVCodecParameters* layer =
++              m_pFormatContext->streams[m_dvEnhancementIndex]->codecpar;
++          if (CDVLayerMerge::IsConfigurationRecord(layer->extradata, layer->extradata_size))
++            st->doviELConfig = FFmpegExtraData(layer->extradata, layer->extradata_size);
++        }
++#endif
+ 
+         sideData = av_packet_side_data_get(pStream->codecpar->coded_side_data,
+                                            pStream->codecpar->nb_coded_side_data,
+@@ -2457,6 +2904,11 @@
+     int idx = m_pFormatContext->programs[m_program]->stream_index[i];
+     if (m_pFormatContext->streams[idx]->discard >= AVDISCARD_ALL)
+       continue;
++#ifdef HAVE_PIDV
++    // joined to the base layer while reading: it has no stream of the player to compare with
++    if (idx == m_dvEnhancementIndex)
++      continue;
++#endif
+     CDemuxStream* stream = GetStream(idx);
+     if (!stream)
+       return true;
+diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h	2026-11-10 06:45:49
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h	2026-11-23 11:53:23
+@@ -9,6 +9,9 @@
+ #pragma once
+ 
+ #include "DVDDemux.h"
++#ifdef HAVE_PIDV
++#include "DVLayerMerge.h"
++#endif
+ #include "threads/CriticalSection.h"
+ #include "threads/SystemClock.h"
+ #include <map>
+@@ -176,6 +179,45 @@
+     AVPacket pkt;       // packet ffmpeg returned
+     int      result;    // result from av_read_packet
+   }m_pkt;
++
++  //! \brief av_read_frame(), with the two tracks of a Dolby Vision stream joined
++  int ReadFrame(AVPacket* packet);
++#ifdef HAVE_PIDV
++  // Dolby Vision in two video tracks (see CDVLayerMerge): the streams of the two layers, or -1
++  int m_dvBaseIndex = -1;
++  int m_dvEnhancementIndex = -1;
++  AVDOVIDecoderConfigurationRecord m_dvRecord{}; //!< of the stream that the two tracks become
++  uint64_t m_dvReported = 0; //!< access units counted in the last line of the log
++  CDVLayerMerge m_dvMerge;
++  //! the packet that was read last had the time of its enhancement access unit checked
++  bool m_dvLayerChecked{false};
++  //! the pair is one by what the container says, or by what its packets said (Layers::verified)
++  bool m_dvVerified{true};
++  void FindDVLayers();
++  void KeepDVLayers();
++  void ReportDVLayers();
++  //! Hades: the offset of the decoding times of the two tracks that the join learned
++  //! (CDVLayerMerge::CONFIRM), in the log once it is not 0 and when it changes, a few times a pair
++  void TellDVOffset();
++  uint64_t m_dvOffsetsTold = 0; //!< CDVLayerMerge::Counts::offsets when it was told last
++  unsigned int m_dvOffsetLines = 0; //!< lines of the log about it for this pair
++  //! what the packets of an unverified pair said: the base stream becomes Dolby Vision, or the
++  //! two tracks go on as two streams
++  void CheckDVLayers();
++  //! A HEVC stream that no Dolby Vision record declares and whose first packets have an RPU
++  //! (CDVLayerMerge::RecordFromRpu()): the packets that were looked at, by stream index, and the
++  //! records of the streams that became Dolby Vision so.
++  std::map<int, unsigned int> m_dvProbed;
++  std::map<int, AVDOVIDecoderConfigurationRecord> m_dvPromoted;
++  void ProbeDolbyVision(CDemuxStream* stream, int streamIdx, const uint8_t* data, int size);
++  //! the stream is Dolby Vision from here on: VideoPlayer opens its codec again
++  void PromoteDolbyVision(CDemuxStream* stream, const AVDOVIDecoderConfigurationRecord& record,
++                          const AVCodecParameters* enhancement);
++  //! Two HEVC tracks, or a Dolby Vision group, that are not joined: why, and what each track is
++  //! (codec, size, framing, Dolby Vision record, PID or track number), once for each line.
++  void LogDVNotJoined(const char* reason);
++  std::string m_dvNotJoined;
++#endif
+ 
+   struct AVCodecParametersDeleter
+   {
+diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.cpp
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.cpp	1970-01-01 08:00:00
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.cpp	2026-11-23 11:53:23
+@@ -0,0 +1,1554 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "DVLayerMerge.h"
++
++#include <algorithm>
++#include <charconv>
++#include <cinttypes>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <iterator>
++#include <limits>
++
++extern "C"
++{
++#include <libavcodec/defs.h>
++#include <libavformat/avformat.h>
++#include <libavutil/avutil.h>
++#include <libavutil/dict.h>
++#include <libavutil/mathematics.h>
++#include <libavutil/mem.h>
++}
++
++namespace
++{
++constexpr uint8_t START_CODE[4] = {0, 0, 0, 1};
++// The header of a unit of type 63 (unspecified), layer 0, temporal id 0: what carries a unit of
++// the enhancement layer in the one-track form.
++constexpr uint8_t WRAP[2] = {0x7e, 0x01};
++constexpr unsigned int NAL_RPU = 62;
++constexpr unsigned int NAL_WRAPPED = 63;
++// the unit types of a random-access picture (IRAP: BLA, IDR, CRA, and the two reserved ones)
++constexpr unsigned int NAL_IRAP_FIRST = 16;
++constexpr unsigned int NAL_IRAP_LAST = 23;
++// the most an hvcC record of an enhancement track is taken to be (as Kodi's demuxer takes the one
++// of a one-track stream)
++constexpr int RECORD_MAX = 1024 * 1024;
++
++// The position of the next 00 00 01 at or after from, or size when there is none.
++size_t FindStartCode(const uint8_t* data, size_t size, size_t from)
++{
++  for (size_t i = from; i + 3 <= size; ++i)
++  {
++    if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1)
++      return i;
++  }
++  return size;
++}
++
++// Calls unit(pointer, size) for each unit of a start-code stream. False when the buffer is not
++// one: something other than zeros before the first start code, a unit shorter than its header, or
++// a unit with the forbidden bit set.
++template<typename F>
++bool ForEachStartCodeUnit(const uint8_t* data, size_t size, F&& unit)
++{
++  size_t code = FindStartCode(data, size, 0);
++  if (code == size)
++    return false;
++
++  for (size_t i = 0; i < code; ++i)
++  {
++    if (data[i] != 0)
++      return false;
++  }
++
++  while (code < size)
++  {
++    const size_t begin = code + 3;
++    const size_t next = FindStartCode(data, size, begin);
++    // zeros before the next start code are its fourth byte or trailing zeros: a unit never ends
++    // with a zero byte
++    size_t end = next;
++    while (end > begin && data[end - 1] == 0)
++      --end;
++
++    if (end - begin < 2 || (data[begin] & 0x80))
++      return false;
++
++    unit(data + begin, end - begin);
++    code = next;
++  }
++  return true;
++}
++
++// Calls unit(pointer, size) for each unit of a buffer that has a length of lengthSize bytes before
++// each unit (MP4, Matroska), or of a start-code stream when lengthSize is 0. A length of 0 is no
++// unit, and fewer bytes at the end than a length are left, as libavcodec leaves them. False when
++// the buffer is no such stream: a length beyond its end, a unit shorter than its header, a unit
++// with the forbidden bit set, or no unit at all.
++template<typename F>
++bool ForEachUnit(const uint8_t* data, size_t size, int lengthSize, F&& unit)
++{
++  if (lengthSize == 0)
++    return ForEachStartCodeUnit(data, size, unit);
++  if (!data || lengthSize < 0 || lengthSize > 4)
++    return false;
++
++  const size_t prefix = static_cast<size_t>(lengthSize);
++  bool any = false;
++  size_t i = 0;
++  while (size - i >= prefix)
++  {
++    size_t length = 0;
++    for (size_t k = 0; k < prefix; ++k)
++      length = length << 8 | data[i + k];
++    i += prefix;
++    if (length > size - i)
++      return false;
++    if (length == 0)
++      continue;
++    if (length < 2 || (data[i] & 0x80))
++      return false;
++    unit(data + i, length);
++    any = true;
++    i += length;
++  }
++  return any;
++}
++
++// Whether an access unit holds a picture that a decoder can start at (a unit of an IRAP type).
++bool RandomAccess(const uint8_t* data, size_t size, int lengthSize)
++{
++  bool found = false;
++  if (data && size > 0)
++    ForEachUnit(data, size, lengthSize,
++                [&found](const uint8_t* unit, size_t)
++                {
++                  const unsigned int type = (unit[0] >> 1) & 0x3f;
++                  found |= type >= NAL_IRAP_FIRST && type <= NAL_IRAP_LAST;
++                });
++  return found;
++}
++
++bool SameTimeBase(AVRational a, AVRational b)
++{
++  return a.num > 0 && a.den > 0 && b.num > 0 && b.den > 0 && av_cmp_q(a, b) == 0;
++}
++
++bool KnownTimeBase(AVRational a)
++{
++  return a.num > 0 && a.den > 0;
++}
++} // unnamed namespace
++
++int CDVLayerMerge::LengthSize(const AVCodecParameters* parameters)
++{
++  if (!parameters || !IsConfigurationRecord(parameters->extradata, parameters->extradata_size))
++    return 0;
++  return (parameters->extradata[21] & 3) + 1;
++}
++
++bool CDVLayerMerge::IsConfigurationRecord(const uint8_t* data, int size)
++{
++  return data && size >= 23 && size <= RECORD_MAX && data[0] == 1;
++}
++
++uint8_t CDVLayerMerge::Level(int width, int height, AVRational rate)
++{
++  struct Limit
++  {
++    uint64_t pixelsPerSecond;
++    int width;
++  };
++  static constexpr Limit LIMITS[] = {
++      {0, 0},
++      {UINT64_C(1280) * 720 * 24, 1280},
++      {UINT64_C(1280) * 720 * 30, 1280},
++      {UINT64_C(1920) * 1080 * 24, 1920},
++      {UINT64_C(1920) * 1080 * 30, 2560},
++      {UINT64_C(1920) * 1080 * 60, 3840},
++      {UINT64_C(3840) * 2160 * 24, 3840},
++      {UINT64_C(3840) * 2160 * 30, 3840},
++      {UINT64_C(3840) * 2160 * 48, 3840},
++      {UINT64_C(3840) * 2160 * 60, 3840},
++      {UINT64_C(3840) * 2160 * 120, 3840},
++      {UINT64_C(3840) * 2160 * 120, 7680},
++      {UINT64_C(7680) * 4320 * 60, 7680},
++      {UINT64_C(7680) * 4320 * 120, 7680},
++  };
++
++  if (width <= 0 || height <= 0 || rate.num <= 0 || rate.den <= 0)
++    return 0;
++
++  const uint64_t pixelsPerSecond = static_cast<uint64_t>(width) * static_cast<uint64_t>(height) *
++                                   static_cast<uint64_t>(rate.num) /
++                                   static_cast<uint64_t>(rate.den);
++  for (uint8_t level = 1; level < std::size(LIMITS); ++level)
++  {
++    if (pixelsPerSecond <= LIMITS[level].pixelsPerSecond && width <= LIMITS[level].width)
++      return level;
++  }
++  return 0;
++}
++
++bool CDVLayerMerge::EnhancementSize(int baseWidth, int baseHeight, int width, int height)
++{
++  if (baseWidth <= 0 || baseHeight <= 0 || width <= 0 || height <= 0)
++    return true;
++
++  const bool quarter = baseWidth == 2 * static_cast<int64_t>(width) &&
++                       baseHeight == 2 * static_cast<int64_t>(height);
++  const bool same = baseWidth == width && baseHeight == height && baseWidth <= 1920;
++  return quarter || same;
++}
++
++CDVLayerMerge::Layers CDVLayerMerge::Find(AVFormatContext* context, unsigned int program)
++{
++  Layers refused;
++  if (!context || !context->iformat || !context->iformat->name)
++    return refused;
++
++  // the names of the demuxers of libavformat that group the two tracks
++  Container container = Container::NONE;
++  if (std::strcmp(context->iformat->name, "mpegts") == 0)
++    container = Container::TRANSPORT_STREAM;
++  else if (std::strcmp(context->iformat->name, "mov,mp4,m4a,3gp,3g2,mj2") == 0)
++    container = Container::MP4;
++  else if (std::strcmp(context->iformat->name, "matroska,webm") == 0)
++    container = Container::MATROSKA;
++  else
++    return refused;
++
++  const auto played = [context, program](const AVStream* stream)
++  {
++    if (program >= context->nb_programs)
++      return true;
++    const unsigned int* begin = context->programs[program]->stream_index;
++    const unsigned int* end = begin + context->programs[program]->nb_stream_indexes;
++    return std::find(begin, end, static_cast<unsigned int>(stream->index)) != end;
++  };
++
++  // Hades: the Dolby Vision groups of libavformat, and those of them that are two Matroska tracks the wrong way round
++  // (below)
++  unsigned int groups = 0;
++  unsigned int reversed = 0;
++  for (unsigned int i = 0; i < context->nb_stream_groups; ++i)
++  {
++    const AVStreamGroup* group = context->stream_groups[i];
++    if (!group || group->type != AV_STREAM_GROUP_PARAMS_DOLBY_VISION)
++      continue;
++    ++groups;
++    if (group->nb_streams != 2 || !group->params.layered_video ||
++        group->params.layered_video->el_index > 1)
++    {
++      refused.reason = "a Dolby Vision group of libavformat that is not a pair of tracks";
++      continue;
++    }
++
++    AVStream* enhancement = group->streams[group->params.layered_video->el_index];
++    AVStream* base = group->streams[1 - group->params.layered_video->el_index];
++    if (!base || !enhancement || base == enhancement || !base->codecpar ||
++        !enhancement->codecpar)
++    {
++      refused.reason = "a Dolby Vision group of libavformat that is not a pair of tracks";
++      continue;
++    }
++    if (base->codecpar->codec_id != AV_CODEC_ID_HEVC ||
++        enhancement->codecpar->codec_id != AV_CODEC_ID_HEVC)
++    {
++      // (a transport stream whose enhancement layer is a private stream, as the Dolby Vision
++      // specification of the transport stream has it, is HEVC once libavformat has looked into
++      // its packets: an input that is not analysed before playback has it as data at first)
++      refused.reason =
++          "a track of the Dolby Vision group of libavformat is not (yet) known as HEVC";
++      continue;
++    }
++    if (!played(base) || !played(enhancement))
++    {
++      refused.reason = "a track of the Dolby Vision group is not in the program that plays";
++      continue;
++    }
++
++    const AVCodecParameters* b = base->codecpar;
++    const AVCodecParameters* e = enhancement->codecpar;
++
++    Layers layers;
++    layers.container = container;
++    layers.base = base->index;
++    layers.enhancement = enhancement->index;
++    layers.rate = av_guess_frame_rate(context, base, nullptr);
++    if (layers.rate.num <= 0 || layers.rate.den <= 0)
++      layers.rate = AVRational{0, 1};
++
++    const AVPacketSideData* sideData =
++        av_packet_side_data_get(e->coded_side_data, e->nb_coded_side_data, AV_PKT_DATA_DOVI_CONF);
++    layers.described = sideData && sideData->size >= sizeof(AVDOVIDecoderConfigurationRecord);
++    if (layers.described)
++    {
++      // The Dolby Vision record of the enhancement track (the descriptor in a transport stream):
++      // profile 7, with the enhancement layer and the RPU. It says that the track has no base
++      // layer; in Matroska files that are found in use it says that it has one (libavformat's
++      // matroskadec.c groups them all the same), so there the flag does not count.
++      std::memcpy(&layers.record, sideData->data, sizeof(layers.record));
++      if (layers.record.dv_profile != 7 || !layers.record.el_present_flag ||
++          !layers.record.rpu_present_flag ||
++          (container != Container::MATROSKA && layers.record.bl_present_flag))
++      {
++        refused.reason = "the Dolby Vision record of the enhancement track is not one of a "
++                         "profile 7 enhancement layer with its RPU";
++        continue;
++      }
++      // libavformat pairs MP4 tracks by a reference, Matroska tracks by the records only: a
++      // second HEVC track of another size than an enhancement layer has is none.
++      if (container != Container::TRANSPORT_STREAM &&
++          !EnhancementSize(b->width, b->height, e->width, e->height))
++      {
++        // Hades: libavformat takes as the enhancement layer of two Matroska tracks the one with a record of an
++        // enhancement layer (matroskadec.c), and some files have that record on the base track alone: the group is
++        // then the wrong way round, the "enhancement" track of the size of a base layer whose enhancement layer the
++        // other one would be. A one-track Dolby Vision file (its record says both layers) with a second HEVC track
++        // is grouped alike. Neither is taken as the group: the two tracks are left to the rule for the Matroska
++        // files that libavformat does not group (below), which finds them unverified, with the larger track as the
++        // base, and makes them a pair only once their packets show it (the RPUs in the smaller track, none in the
++        // larger one): so the first file is joined, and the second plays as it did.
++        if (container == Container::MATROSKA &&
++            EnhancementSize(e->width, e->height, b->width, b->height))
++        {
++          ++reversed;
++          continue;
++        }
++        layers.result = Layers::Result::WRONG_SIZE;
++        refused = layers;
++        continue;
++      }
++    }
++    else if (container != Container::TRANSPORT_STREAM)
++    {
++      // an MP4 or Matroska pair is only known by the record (none: libavformat made no group)
++      refused.reason = "a Dolby Vision group of libavformat without the record of the enhancement "
++                       "track";
++      continue;
++    }
++    else
++    {
++      // The discs themselves have no Dolby Vision descriptor: libavformat knows the pair by the
++      // stream numbers that the Blu-ray format gives to the two layers. A second HEVC track of
++      // another size than an enhancement layer has is none.
++      if (!EnhancementSize(b->width, b->height, e->width, e->height))
++      {
++        layers.result = Layers::Result::WRONG_SIZE;
++        refused = layers;
++        continue;
++      }
++      layers.record.dv_version_major = 1;
++      layers.record.dv_version_minor = 0;
++      layers.record.dv_profile = 7;
++      layers.record.dv_level = Level(b->width, b->height, layers.rate);
++      layers.record.rpu_present_flag = 1;
++      layers.record.el_present_flag = 1;
++      layers.record.dv_bl_signal_compatibility_id = 6; // the base layer of a Blu-ray is HDR10
++    }
++
++    // A transport stream has start codes; MP4 and Matroska a length before each unit, with an
++    // hvcC record. Both tracks are framed as their container frames them.
++    layers.baseLengthSize = LengthSize(b);
++    layers.enhancementLengthSize = LengthSize(e);
++    const bool startCodes = container == Container::TRANSPORT_STREAM;
++    if ((layers.baseLengthSize == 0) != startCodes ||
++        (layers.enhancementLengthSize == 0) != startCodes)
++    {
++      layers.result = Layers::Result::FRAMING;
++      refused = layers;
++      continue;
++    }
++    layers.decodingTimes = container != Container::MATROSKA;
++
++    // The record of the one-track form: both layers in one stream. The descriptor of the
++    // enhancement track has ones in the bits that newer streams use for the compression of the
++    // metadata, which profile 7 does not have.
++    layers.record.bl_present_flag = 1;
++    layers.record.dv_md_compression = AV_DOVI_COMPRESSION_NONE;
++    layers.result = Layers::Result::JOINED;
++    return layers;
++  }
++
++  // Matroska files that libavformat does not group (see the comment of Find() in the header):
++  // only where it made no Dolby Vision group at all (Hades: or only ones of two Matroska tracks
++  // the wrong way round).
++  if (refused.result != Layers::Result::NONE)
++    return refused;
++  if (groups > reversed)
++    return refused;
++  if (container == Container::TRANSPORT_STREAM)
++  {
++    // The discs themselves have no Dolby Vision descriptor: libavformat knows the pair by the
++    // stream numbers (PIDs 0x1011 and 0x1015) that the Blu-ray format gives to the two layers.
++    // If libavformat did not group them (e.g. because the PMT has no "HDMV" registration descriptor),
++    // detect the Blu-ray pair directly from the program's streams.
++    AVStream* base = nullptr;
++    AVStream* enhancement = nullptr;
++    for (unsigned int i = 0; i < context->nb_streams; ++i)
++    {
++      AVStream* stream = context->streams[i];
++      if (!stream || !stream->codecpar || stream->codecpar->codec_type != AVMEDIA_TYPE_VIDEO ||
++          stream->codecpar->codec_id != AV_CODEC_ID_HEVC ||
++          (stream->disposition & AV_DISPOSITION_ATTACHED_PIC) || !played(stream))
++        continue;
++      if (stream->id == 0x1011)
++        base = stream;
++      else if (stream->id == 0x1015)
++        enhancement = stream;
++    }
++    if (base && enhancement)
++    {
++      const AVCodecParameters* b = base->codecpar;
++      const AVCodecParameters* e = enhancement->codecpar;
++      Layers layers;
++      if (!EnhancementSize(b->width, b->height, e->width, e->height))
++      {
++        layers.result = Layers::Result::WRONG_SIZE;
++        return layers;
++      }
++      layers.container = container;
++      layers.base = base->index;
++      layers.enhancement = enhancement->index;
++      layers.rate = av_guess_frame_rate(context, base, nullptr);
++      if (layers.rate.num <= 0 || layers.rate.den <= 0)
++        layers.rate = AVRational{0, 1};
++      layers.baseLengthSize = LengthSize(b);
++      layers.enhancementLengthSize = LengthSize(e);
++      if (layers.baseLengthSize != 0 || layers.enhancementLengthSize != 0)
++      {
++        layers.result = Layers::Result::FRAMING;
++        return layers;
++      }
++      layers.decodingTimes = true;
++      layers.record.dv_version_major = 1;
++      layers.record.dv_version_minor = 0;
++      layers.record.dv_profile = 7;
++      layers.record.dv_level = Level(b->width, b->height, layers.rate);
++      layers.record.rpu_present_flag = 1;
++      layers.record.el_present_flag = 1;
++      layers.record.bl_present_flag = 1;
++      layers.record.dv_bl_signal_compatibility_id = 6;
++      layers.record.dv_md_compression = AV_DOVI_COMPRESSION_NONE;
++      layers.result = Layers::Result::JOINED;
++      return layers;
++    }
++  }
++  if (container != Container::MATROSKA)
++  {
++    refused.reason = container == Container::MP4
++                         ? "no Dolby Vision group of libavformat (in MP4: the 'vdep' reference "
++                           "of an enhancement track with its record, in a Dolby Vision sample "
++                           "entry, or in an HEVC one with a reference to one track only)"
++                         : "no Dolby Vision group of libavformat (in a transport stream: the "
++                           "Dolby Vision descriptor of the enhancement track, or the stream "
++                           "numbers of a Blu-ray program)";
++    return refused;
++  }
++  AVStream* tracks[2] = {};
++  unsigned int hevc = 0;
++  for (unsigned int i = 0; i < context->nb_streams; ++i)
++  {
++    AVStream* stream = context->streams[i];
++    if (!stream || !stream->codecpar || stream->codecpar->codec_type != AVMEDIA_TYPE_VIDEO ||
++        stream->codecpar->codec_id != AV_CODEC_ID_HEVC ||
++        (stream->disposition & AV_DISPOSITION_ATTACHED_PIC) || !played(stream))
++      continue;
++    if (hevc < 2)
++      tracks[hevc] = stream;
++    ++hevc;
++  }
++  if (hevc != 2)
++  {
++    refused.reason = hevc > 2 ? "no Dolby Vision group of libavformat, and more than two HEVC "
++                                "video tracks"
++                              : "no Dolby Vision group of libavformat";
++    return refused;
++  }
++  const auto area = [](const AVStream* s)
++  { return static_cast<int64_t>(s->codecpar->width) * s->codecpar->height; };
++  AVStream* base = area(tracks[0]) >= area(tracks[1]) ? tracks[0] : tracks[1];
++  AVStream* enhancement = base == tracks[0] ? tracks[1] : tracks[0];
++  const AVCodecParameters* b = base->codecpar;
++  const AVCodecParameters* e = enhancement->codecpar;
++  // sizes that are known, and that are the ones of a pair; a length before each unit
++  if (b->width <= 0 || b->height <= 0 || e->width <= 0 || e->height <= 0 ||
++      !EnhancementSize(b->width, b->height, e->width, e->height))
++  {
++    refused.reason = "no Dolby Vision group of libavformat, and the two HEVC tracks do not have "
++                     "the sizes of a base layer and its enhancement layer";
++    return refused;
++  }
++  if (!LengthSize(b) || !LengthSize(e))
++  {
++    refused.reason = "no Dolby Vision group of libavformat, and a track without an hvcC record";
++    return refused;
++  }
++  // what records the tracks have must not speak against it: the first one says it has a base
++  // layer, the second one an RPU, of profile 7 or 8 (a MEL)
++  const auto recordOf = [](const AVCodecParameters* par) -> const AVDOVIDecoderConfigurationRecord*
++  {
++    const AVPacketSideData* sd = av_packet_side_data_get(par->coded_side_data,
++                                                         par->nb_coded_side_data,
++                                                         AV_PKT_DATA_DOVI_CONF);
++    return sd && sd->size >= sizeof(AVDOVIDecoderConfigurationRecord)
++               ? reinterpret_cast<const AVDOVIDecoderConfigurationRecord*>(sd->data)
++               : nullptr;
++  };
++  const AVDOVIDecoderConfigurationRecord* baseRecord = recordOf(b);
++  const AVDOVIDecoderConfigurationRecord* layerRecord = recordOf(e);
++  if ((baseRecord && !baseRecord->bl_present_flag) ||
++      (layerRecord && (!layerRecord->rpu_present_flag ||
++                       (layerRecord->dv_profile != 7 && layerRecord->dv_profile != 8))))
++  {
++    refused.reason = "no Dolby Vision group of libavformat, and Dolby Vision records that are not "
++                     "the ones of a base layer and of an enhancement layer with RPUs";
++    return refused;
++  }
++
++  Layers layers;
++  layers.container = container;
++  layers.base = base->index;
++  layers.enhancement = enhancement->index;
++  layers.described = layerRecord != nullptr;
++  layers.rate = av_guess_frame_rate(context, base, nullptr);
++  if (layers.rate.num <= 0 || layers.rate.den <= 0)
++    layers.rate = AVRational{0, 1};
++  layers.baseLengthSize = LengthSize(b);
++  layers.enhancementLengthSize = LengthSize(e);
++  layers.decodingTimes = false;
++  layers.verified = false;
++  // the record of the one-track form of the two tracks of a disc
++  layers.record.dv_version_major = 1;
++  layers.record.dv_version_minor = 0;
++  layers.record.dv_profile = 7;
++  layers.record.dv_level = Level(b->width, b->height, layers.rate);
++  layers.record.rpu_present_flag = 1;
++  layers.record.el_present_flag = 1;
++  layers.record.bl_present_flag = 1;
++  layers.record.dv_bl_signal_compatibility_id = 6;
++  layers.record.dv_md_compression = AV_DOVI_COMPRESSION_NONE;
++  layers.result = Layers::Result::JOINED;
++  return layers;
++}
++
++namespace
++{
++struct RpuBits
++{
++  const uint8_t* data = nullptr;
++  size_t size = 0;
++  size_t bit = 0;
++  bool over = false;
++
++  uint64_t Get(unsigned int n)
++  {
++    uint64_t v = 0;
++    for (unsigned int i = 0; i < n; ++i)
++    {
++      if (bit / 8 >= size)
++      {
++        over = true;
++        return 0;
++      }
++      v = (v << 1) | ((data[bit / 8] >> (7 - (bit & 7))) & 1u);
++      ++bit;
++    }
++    return v;
++  }
++
++  uint64_t Ue()
++  {
++    unsigned int zeros = 0;
++    while (!Get(1))
++    {
++      if (over || ++zeros > 31)
++      {
++        over = true;
++        return 0;
++      }
++    }
++    return ((UINT64_C(1) << zeros) - 1) + Get(zeros);
++  }
++};
++} // namespace
++
++void CDVLayerMerge::ProbeRpu(const uint8_t* data, size_t size, int lengthSize, RpuProbe& out)
++{
++  out = RpuProbe{};
++  if (!data || !size || lengthSize < 0 || lengthSize > 4)
++    return;
++
++  bool layer = false;
++  const uint8_t* rpuUnit = nullptr;
++  size_t rpuUnitSize = 0;
++  size_t unitIndex = 0;
++  ForEachUnit(data, size, lengthSize,
++              [&](const uint8_t* unit, size_t unitSize)
++              {
++                if (unitSize < 2 || (unit[0] & 0x80))
++                  return;
++                const unsigned int type = (unit[0] >> 1) & 0x3f;
++                if (type == 63)
++                  layer = true;
++                const unsigned int layerId = ((unit[0] & 1) << 5) | (unit[1] >> 3);
++                if (unitIndex++ && type == 62 && !layerId && (unit[1] & 7) == 1 && unitSize > 2)
++                {
++                  rpuUnit = unit;
++                  rpuUnitSize = unitSize;
++                }
++              });
++  if (!rpuUnit)
++    return;
++
++  uint8_t rpu[1024];
++  size_t n = 0;
++  unsigned int zeros = 0;
++  for (size_t i = 2; i < rpuUnitSize && n < sizeof(rpu); ++i)
++  {
++    if (zeros >= 2 && rpuUnit[i] == 3)
++    {
++      zeros = 0;
++      continue;
++    }
++    zeros = rpuUnit[i] == 0 ? zeros + 1 : 0;
++    rpu[n++] = rpuUnit[i];
++  }
++  while (n && !rpu[n - 1])
++    --n;
++  if (n < 5 || rpu[0] != 25)
++    return;
++
++  RpuBits b{rpu + 1, n - 1};
++  if (b.Get(6) != 2)
++    return;
++  const unsigned int format = static_cast<unsigned int>(b.Get(11));
++  const unsigned int rpuProfile = static_cast<unsigned int>(b.Get(4));
++  b.Get(4); // vdr_rpu_level
++  if (!b.Get(1)) // vdr_seq_info_present_flag
++    return;
++  b.Get(1); // chroma_resampling_explicit_filter_flag
++  const uint64_t type = b.Get(2);
++  if (type > 1)
++    return;
++  if (type == 0)
++  {
++    const uint64_t denom = b.Ue();
++    if (denom < 13 || denom > 32)
++      return;
++  }
++  b.Get(2); // vdr_rpu_normalized_idc
++  const bool fullRange = b.Get(1) != 0;
++  if (format & 0x700)
++    return;
++  const uint64_t bl = b.Ue();
++  const uint64_t el = b.Ue();
++  const uint64_t vdr = b.Ue();
++  if (bl > 8 || (el & 0xff) > 8 || vdr > 8)
++    return;
++  b.Get(1); // spatial_resampling_filter_flag
++  b.Get(3); // reserved / dm_compression
++  const bool elResampling = b.Get(1) != 0;
++  const bool disabled = b.Get(1) != 0;
++  if (b.over)
++    return;
++
++  out.rpu = true;
++  out.layer = layer;
++  out.rpu_profile = rpuProfile;
++  out.vdr_bit_depth = static_cast<unsigned int>(vdr) + 8;
++  out.bl_full_range = fullRange;
++  out.el_resampling = elResampling;
++  out.residual_disabled = disabled;
++  if (rpuProfile == 0 && fullRange)
++    out.profile = 5;
++  else if (rpuProfile == 1 && elResampling && !disabled)
++    out.profile = out.vdr_bit_depth == 12 ? 7 : 4;
++  else if (rpuProfile == 1)
++    out.profile = 8;
++}
++
++bool CDVLayerMerge::RecordFromRpu(const RpuProbe& probe,
++                                  const AVCodecParameters* parameters,
++                                  AVRational rate,
++                                  AVDOVIDecoderConfigurationRecord& record)
++{
++  if (!probe.rpu || !parameters)
++    return false;
++
++  record = AVDOVIDecoderConfigurationRecord{};
++  record.dv_version_major = 1;
++  record.dv_version_minor = 0;
++  record.rpu_present_flag = 1;
++  record.bl_present_flag = 1;
++  record.dv_md_compression = AV_DOVI_COMPRESSION_NONE;
++  if (probe.layer)
++  {
++    // both layers in the stream: the RPU of profile 7, FEL or MEL alike (a 12-bit picture made
++    // with the resampled enhancement layer and its residual); profile 4, whose base layer is SDR,
++    // has another one
++    if (probe.rpu_profile != 1 || probe.profile != 7)
++      return false;
++    record.dv_profile = 7;
++    record.el_present_flag = 1;
++    record.dv_bl_signal_compatibility_id = 6;
++  }
++  else if (probe.profile == 5)
++  {
++    record.dv_profile = 5;
++    record.dv_bl_signal_compatibility_id = 0;
++  }
++  else if (probe.profile == 8)
++  {
++    // the base layer is a picture of its own: what it is, its colour says
++    const bool bt2020 = parameters->color_primaries == AVCOL_PRI_BT2020;
++    if (bt2020 && parameters->color_trc == AVCOL_TRC_SMPTE2084)
++      record.dv_bl_signal_compatibility_id = 1;
++    else if (parameters->color_trc == AVCOL_TRC_ARIB_STD_B67)
++      record.dv_bl_signal_compatibility_id = 4;
++    else if (parameters->color_primaries == AVCOL_PRI_BT709 &&
++             parameters->color_trc == AVCOL_TRC_BT709)
++      record.dv_bl_signal_compatibility_id = 2;
++    else
++      return false;
++    record.dv_profile = 8;
++  }
++  else
++    return false;
++  record.dv_level = Level(parameters->width, parameters->height, rate);
++  return true;
++}
++
++CDVLayerMerge::~CDVLayerMerge()
++{
++  Forget(m_base);
++  Forget(m_enhancement);
++}
++
++void CDVLayerMerge::Forget(Track& track)
++{
++  for (Waiting& waiting : track.waiting)
++    av_packet_free(&waiting.packet);
++  track.waiting.clear();
++  track.known = false;
++  track.started = false;
++  track.unstarted = 0;
++  track.presented.clear();
++}
++
++void CDVLayerMerge::Configure(const Layers& layers)
++{
++  SetRate(layers.rate);
++  m_base.lengthSize = layers.baseLengthSize;
++  m_enhancement.lengthSize = layers.enhancementLengthSize;
++  m_fromPresentation = !layers.decodingTimes;
++  // (decided once for the pair: the same pair found again keeps what its packets said)
++  if (layers.verified)
++    m_verification = Verification::VERIFIED;
++  else if (!m_verifyDone)
++    m_verification = Verification::PENDING;
++}
++
++void CDVLayerMerge::Restart()
++{
++  Clear();
++  // (Hades: another pair of tracks, another offset)
++  m_offset = 0;
++  m_counts.offset = 0;
++  m_verification = Verification::VERIFIED;
++  m_verifyDone = false;
++  m_verifyLayer = 0;
++  m_verifyBase = 0;
++  m_layerRpu = false;
++}
++
++// For an unverified pair (Layers::verified): the first packets of the first track must have no
++// RPU and no units of an enhancement layer (it would be a Dolby Vision stream of its own), and one
++// of the first VERIFY_PACKETS of the second track must have the RPU of a dual-layer stream, and
++// no units of type 63.
++void CDVLayerMerge::Verify(const AVPacket* packet, bool enhancement)
++{
++  if (m_verification != Verification::PENDING)
++    return;
++  RpuProbe probe;
++  ProbeRpu(packet->data, static_cast<size_t>(std::max(packet->size, 0)),
++                            enhancement ? m_enhancement.lengthSize : m_base.lengthSize, &probe);
++  if (!enhancement)
++  {
++    if (probe.rpu || probe.layer)
++      m_verification = Verification::REFUSED;
++    else if (m_verifyBase < VERIFY_PACKETS)
++      ++m_verifyBase;
++  }
++  else if (probe.rpu && !probe.layer && probe.rpu_profile == 1)
++    m_layerRpu = true;
++  else if (++m_verifyLayer >= VERIFY_PACKETS && !m_layerRpu)
++    m_verification = Verification::REFUSED;
++
++  if (m_verification == Verification::PENDING && m_layerRpu && m_verifyBase > 0)
++    m_verification = Verification::VERIFIED;
++  m_verifyDone = m_verification != Verification::PENDING;
++}
++
++// The early packets of the enhancement track (Waiting::early): when the first one after them has
++// its time, they are the access units just before it, in order, and so are the base packets just
++// before the base packet of that time. Those that the base track does not have (it starts later,
++// or they went out) stay without a time, and are dropped. True while that has to be waited for:
++// the track may still start, or the time of its first packet or the base packet of it is still
++// to come.
++bool CDVLayerMerge::Backfill()
++{
++  std::deque<Waiting>& layer = m_enhancement.waiting;
++  if (!m_fromPresentation || layer.empty() || !layer.front().early)
++    return false;
++
++  size_t first = 0;
++  while (first < layer.size() && layer[first].early)
++    ++first;
++  const auto resolve = [&layer, first]()
++  {
++    for (size_t k = 0; k < first; ++k)
++      layer[k].early = false;
++    return false;
++  };
++  if (first == layer.size() || layer[first].pending || layer[first].time == AV_NOPTS_VALUE)
++  {
++    // the track has not started, or its first time is still to come
++    if (!m_enhancement.started && m_enhancement.unstarted >= m_silentAfter)
++      return resolve();
++    return true;
++  }
++
++  std::deque<Waiting>& base = m_base.waiting;
++  const Waiting& start = layer[first];
++  const auto it = std::find_if(base.begin(), base.end(), [&start](const Waiting& b)
++                               { return SameUnit(b, start); });
++  if (it == base.end())
++  {
++    // a base packet with a time after it: the base packet of it is gone, or never came
++    const bool past = std::any_of(base.begin(), base.end(), [&start](const Waiting& b)
++                                  { return After(b, start); });
++    return past ? resolve() : true;
++  }
++  size_t k = first;
++  for (auto b = it; k > 0 && b != base.begin();)
++  {
++    --b;
++    if (b->pending || b->time == AV_NOPTS_VALUE)
++      break;
++    --k;
++    layer[k].time = b->time;
++    layer[k].slack = b->slack;
++  }
++  return resolve();
++}
++
++// After a refusal: what waits goes out as it was read, the first track before the second.
++bool CDVLayerMerge::PopRefused(AVPacket* packet)
++{
++  Track& track = !m_base.waiting.empty() ? m_base : m_enhancement;
++  if (track.waiting.empty())
++    return false;
++  Waiting waiting = track.waiting.front();
++  track.waiting.pop_front();
++  if (&track == &m_base)
++    m_counts.alone++;
++  av_packet_move_ref(packet, waiting.packet);
++  av_packet_free(&waiting.packet);
++  return true;
++}
++
++void CDVLayerMerge::Clear()
++{
++  Forget(m_base);
++  Forget(m_enhancement);
++  // a stream that never had a packet of the layer is not waited for again after every seek
++  m_silent = m_absent ? m_silentAfter : 0;
++  m_end = false;
++  // (Hades: the offset of the decoding times stays, and is checked again: CONFIRM)
++  m_joinedSinceClear = false;
++  m_seen.clear();
++}
++
++void CDVLayerMerge::SetSilent(unsigned int packets)
++{
++  m_silentAfter = std::clamp(packets, SILENT, static_cast<unsigned int>(MAX_WAITING - 1));
++}
++
++void CDVLayerMerge::SetRate(AVRational rate)
++{
++  if (rate.num <= 0 || rate.den <= 0)
++  {
++    SetSilent(SILENT);
++    return;
++  }
++  const int64_t packets = av_rescale(5, rate.num, 2 * static_cast<int64_t>(rate.den));
++  SetSilent(static_cast<unsigned int>(
++      std::clamp<int64_t>(packets, 0, static_cast<int64_t>(MAX_WAITING))));
++}
++
++// A time of the enhancement track in the time base of the base track (as it is when the two are
++// the same or not known; AV_NOPTS_VALUE when it does not fit).
++int64_t CDVLayerMerge::ToBase(int64_t time) const
++{
++  if (time == AV_NOPTS_VALUE || !KnownTimeBase(m_timeBase) ||
++      !KnownTimeBase(m_enhancementTimeBase) || SameTimeBase(m_timeBase, m_enhancementTimeBase))
++    return time;
++  return av_rescale_q(time, m_enhancementTimeBase, m_timeBase);
++}
++
++// The decoding time of an access unit is its own, or, when its PES packet gave it none (it was
++// not the first one in it), the one that follows from the unit before it in the track: that time
++// plus that duration. The duration is a rounded number, so a time that follows is only known to
++// half a duration.
++//
++// In Matroska the packets have no decoding times. There the time is made from the presentation
++// times (see REORDER): from a random-access packet of the track on, the times of its packets go
++// into a heap, and each time the heap holds more than REORDER of them, the least one is the time
++// of the oldest packet that waits for one. Packets of the track before such a packet have none.
++//
++// The times of the enhancement track are taken to the time base of the base track, with a slack
++// of one more for the rounding of that.
++bool CDVLayerMerge::Queue(Track& track, AVPacket* packet, bool enhancement)
++{
++  Waiting waiting;
++  waiting.packet = av_packet_alloc();
++  if (!waiting.packet)
++  {
++    av_packet_unref(packet);
++    return false;
++  }
++
++  const bool converted = enhancement && KnownTimeBase(m_timeBase) &&
++                         KnownTimeBase(m_enhancementTimeBase) &&
++                         !SameTimeBase(m_timeBase, m_enhancementTimeBase);
++  if (m_fromPresentation)
++  {
++    waiting.time = AV_NOPTS_VALUE;
++    if (!track.started)
++      track.started = RandomAccess(packet->data, static_cast<size_t>(std::max(packet->size, 0)),
++                                   track.lengthSize);
++    if (!track.started && track.unstarted < std::numeric_limits<unsigned int>::max())
++      ++track.unstarted;
++    waiting.early = enhancement && !track.started;
++    const int64_t pts = enhancement ? ToBase(packet->pts) : packet->pts;
++    if (track.started && pts != AV_NOPTS_VALUE)
++    {
++      track.presented.push_back(pts);
++      std::push_heap(track.presented.begin(), track.presented.end(), std::greater<int64_t>());
++      waiting.pending = true;
++      // the two times of an access unit are the same but for the rounding of a time base: a
++      // quarter of a duration takes that, and is far from the time of the next picture
++      const int64_t duration = enhancement ? ToBase(packet->duration) : packet->duration;
++      waiting.slack = (duration > 0 ? duration / 4 : 0) + (converted ? 1 : 0);
++    }
++  }
++  else
++  {
++    waiting.time = packet->dts;
++    if (packet->dts == AV_NOPTS_VALUE && track.known && track.time != AV_NOPTS_VALUE &&
++        track.duration > 0 && track.time <= std::numeric_limits<int64_t>::max() - track.duration)
++    {
++      waiting.time = track.time + track.duration;
++      waiting.slack = track.duration / 2;
++    }
++    track.time = waiting.time;
++    track.duration = packet->duration;
++    track.known = true;
++    if (converted)
++    {
++      waiting.time = ToBase(waiting.time);
++      waiting.slack = waiting.time == AV_NOPTS_VALUE
++                          ? 0
++                          : std::max<int64_t>(ToBase(waiting.slack), 0) + 1;
++    }
++  }
++
++  // (Hades: for the offset of the decoding times, CONFIRM)
++  waiting.pts = enhancement ? ToBase(packet->pts) : packet->pts;
++  av_packet_move_ref(waiting.packet, packet);
++  track.waiting.push_back(waiting);
++  if (m_fromPresentation)
++    GiveTimes(track, REORDER);
++  return true;
++}
++
++// The least times of the heap go to the oldest packets that wait for theirs, until it holds keep
++// of them. Each packet that waits for a time put one in the heap, so there is always one.
++void CDVLayerMerge::GiveTimes(Track& track, size_t keep)
++{
++  while (track.presented.size() > keep)
++  {
++    std::pop_heap(track.presented.begin(), track.presented.end(), std::greater<int64_t>());
++    const int64_t time = track.presented.back();
++    track.presented.pop_back();
++    const auto it = std::find_if(track.waiting.begin(), track.waiting.end(),
++                                 [](const Waiting& waiting) { return waiting.pending; });
++    if (it == track.waiting.end())
++      continue;
++    it->time = time;
++    it->pending = false;
++  }
++}
++
++bool CDVLayerMerge::PushBase(AVPacket* packet)
++{
++  if (m_silent < m_silentAfter && ++m_silent == m_silentAfter && !m_any)
++    m_absent = true;
++  Verify(packet, false);
++  return Queue(m_base, packet, false);
++}
++
++bool CDVLayerMerge::PushEnhancement(AVPacket* packet)
++{
++  m_silent = 0;
++  m_any = true;
++  m_absent = false;
++  // (the oldest packet has its time: fewer than MAX_QUEUED wait for theirs, see GiveTimes())
++  if (m_enhancement.waiting.size() >= MAX_QUEUED)
++  {
++    Remember(m_enhancement.waiting.front());
++    av_packet_free(&m_enhancement.waiting.front().packet);
++    m_enhancement.waiting.pop_front();
++    m_counts.dropped++;
++  }
++  Verify(packet, true);
++  return Queue(m_enhancement, packet, true);
++}
++
++bool CDVLayerMerge::Append(AVPacket* base,
++                           const uint8_t* enhancement,
++                           size_t size,
++                           int baseLengthSize,
++                           int enhancementLengthSize)
++{
++  if (!base || base->size < 0 || !enhancement || size == 0 || baseLengthSize < 0 ||
++      baseLengthSize > 4 || enhancementLengthSize < 0 || enhancementLengthSize > 4)
++    return false;
++
++  // what comes before each unit in the framing of the base packet, and the most a length says
++  const size_t prefix = baseLengthSize ? static_cast<size_t>(baseLengthSize) : sizeof(START_CODE);
++  const uint64_t most = baseLengthSize ? (UINT64_C(1) << (8 * baseLengthSize)) - 1 : UINT64_MAX;
++  size_t extra = 0;
++  bool wrapped = false;
++  bool fits = true;
++  if (!ForEachUnit(enhancement, size, enhancementLengthSize,
++                   [&](const uint8_t* unit, size_t length)
++                   {
++                     const unsigned int type = (unit[0] >> 1) & 0x3f;
++                     wrapped |= type == NAL_WRAPPED;
++                     const size_t body = (type == NAL_RPU ? 0 : sizeof(WRAP)) + length;
++                     fits &= body <= most;
++                     extra += prefix + body;
++                   }) ||
++      wrapped || !fits)
++    return false;
++
++  if (extra == 0 ||
++      extra > static_cast<size_t>(std::numeric_limits<int>::max() - AV_INPUT_BUFFER_PADDING_SIZE) -
++                  static_cast<size_t>(base->size))
++    return false;
++
++  const int before = base->size;
++  if (av_grow_packet(base, static_cast<int>(extra)) < 0)
++    return false;
++
++  uint8_t* out = base->data + before;
++  ForEachUnit(enhancement, size, enhancementLengthSize,
++              [&out, baseLengthSize](const uint8_t* unit, size_t length)
++              {
++                const unsigned int type = (unit[0] >> 1) & 0x3f;
++                const size_t body = (type == NAL_RPU ? 0 : sizeof(WRAP)) + length;
++                if (baseLengthSize)
++                {
++                  for (int k = baseLengthSize - 1; k >= 0; --k)
++                    *out++ = static_cast<uint8_t>(body >> (8 * k));
++                }
++                else
++                {
++                  std::memcpy(out, START_CODE, sizeof(START_CODE));
++                  out += sizeof(START_CODE);
++                }
++                if (type != NAL_RPU)
++                {
++                  std::memcpy(out, WRAP, sizeof(WRAP));
++                  out += sizeof(WRAP);
++                }
++                std::memcpy(out, unit, length);
++                out += length;
++              });
++  return true;
++}
++
++void CDVLayerMerge::SetTimeBases(AVRational base, AVRational enhancement)
++{
++  m_timeBase = base;
++  m_enhancementTimeBase = enhancement;
++}
++
++// What the packet already has in its strings metadata stays. False when it could not be set:
++// the packet then has what it had, or no strings metadata at all.
++bool CDVLayerMerge::SetLayerTime(AVPacket* packet, const char* value)
++{
++  AVDictionary* dictionary = nullptr;
++  size_t size = 0;
++  bool set = false;
++  const uint8_t* old = av_packet_get_side_data(packet, AV_PKT_DATA_STRINGS_METADATA, &size);
++  if ((!old || av_packet_unpack_dictionary(old, size, &dictionary) >= 0) &&
++      av_dict_set(&dictionary, LAYER_TIME, value, 0) >= 0)
++  {
++    uint8_t* data = av_packet_pack_dictionary(dictionary, &size);
++    if (data)
++    {
++      av_packet_side_data_remove(packet->side_data, &packet->side_data_elems,
++                                 AV_PKT_DATA_STRINGS_METADATA);
++      set = av_packet_add_side_data(packet, AV_PKT_DATA_STRINGS_METADATA, data, size) >= 0;
++      if (!set)
++        av_free(data);
++    }
++  }
++  av_dict_free(&dictionary);
++  return set;
++}
++
++// See LAYER_TIME.
++void CDVLayerMerge::AttachLayerTime(AVPacket* base, int64_t enhancementPts) const
++{
++  if (m_timeBase.num <= 0 || m_timeBase.den <= 0 || m_enhancementTimeBase.num <= 0 ||
++      m_enhancementTimeBase.den <= 0 || base->pts == AV_NOPTS_VALUE ||
++      enhancementPts == AV_NOPTS_VALUE)
++    return;
++
++  // av_rescale_q() gives AV_NOPTS_VALUE for what does not fit
++  const int64_t pts = av_cmp_q(m_enhancementTimeBase, m_timeBase) == 0
++                          ? enhancementPts
++                          : av_rescale_q(enhancementPts, m_enhancementTimeBase, m_timeBase);
++  const int64_t limit = av_rescale(MAX_LAYER_APART, m_timeBase.den, m_timeBase.num);
++  if (pts == AV_NOPTS_VALUE || limit <= 0)
++    return;
++
++  const bool later = pts > base->pts;
++  const uint64_t apart = later ? static_cast<uint64_t>(pts) - static_cast<uint64_t>(base->pts)
++                               : static_cast<uint64_t>(base->pts) - static_cast<uint64_t>(pts);
++  if (apart > static_cast<uint64_t>(limit))
++    return;
++
++  char value[80];
++  std::snprintf(value, sizeof(value), "%s%" PRIu64 " %d %d", later || apart == 0 ? "" : "-", apart,
++                m_timeBase.num, m_timeBase.den);
++  SetLayerTime(base, value);
++}
++
++namespace
++{
++// "<difference> <numerator> <denominator>": decimal, one space between them, nothing else, as
++// the module that takes the entry reads it (parse_layer_time() in dvbridge_fel.c).
++bool ParseLayerTime(const char* text, int64_t& apart, int& num, int& den)
++{
++  const char* const end = text + std::strlen(text);
++  auto read = std::from_chars(text, end, apart);
++  // (the module reads the sign and then the number: the least value is none to it)
++  if (read.ec != std::errc() || read.ptr == end || *read.ptr != ' ' ||
++      apart == std::numeric_limits<int64_t>::min())
++    return false;
++  read = std::from_chars(read.ptr + 1, end, num);
++  if (read.ec != std::errc() || read.ptr == end || *read.ptr != ' ')
++    return false;
++  read = std::from_chars(read.ptr + 1, end, den);
++  return read.ec == std::errc() && read.ptr == end && num > 0 && den > 0;
++}
++} // namespace
++
++bool CDVLayerMerge::CheckLayerTime(AVPacket* packet,
++                                   const std::function<double(int64_t)>& microseconds)
++{
++  if (packet->pts == AV_NOPTS_VALUE)
++    return true;
++
++  // The difference as AttachLayerTime() wrote it, in the time base of the packet. An entry in
++  // another time base is one that was set right here before (a reader may keep a packet and
++  // look at it again): its difference is not one to add to the time of the packet.
++  size_t size = 0;
++  AVDictionary* dictionary = nullptr;
++  int64_t apart = 0;
++  int num = 0;
++  int den = 0;
++  bool written = false;
++  const uint8_t* data = av_packet_get_side_data(packet, AV_PKT_DATA_STRINGS_METADATA, &size);
++  if (data && av_packet_unpack_dictionary(data, size, &dictionary) >= 0)
++  {
++    const AVDictionaryEntry* entry = av_dict_get(dictionary, LAYER_TIME, nullptr, 0);
++    written = entry && ParseLayerTime(entry->value, apart, num, den) &&
++              av_cmp_q(AVRational{num, den}, m_timeBase) == 0;
++  }
++  av_dict_free(&dictionary);
++  if (!written)
++    return true;
++
++  // Both times as the reader has them, to a microsecond for the arithmetic: pictures are
++  // thousands of them apart.
++  const int64_t most = std::numeric_limits<int64_t>::max() - 1;
++  const int64_t least = std::numeric_limits<int64_t>::min() + 1;
++  const bool fits = apart >= 0 ? packet->pts <= most - apart : packet->pts >= least - apart;
++  bool usable = false;
++  if (fits)
++  {
++    // The base picture that is presented with the access unit has the time that the reader
++    // makes of the time of the access unit. A time that the reader also gives to the time
++    // after it is one that it makes of many (Kodi's: 0, of every time in the half second
++    // before the start), and names no picture.
++    const int64_t unit = packet->pts + apart;
++    const double layer = microseconds(unit);
++    if (microseconds(unit + 1) != layer)
++    {
++      const double wanted = static_cast<double>(apart) * num / den * 1e6;
++      const double found = layer - microseconds(packet->pts);
++      if (std::abs(found - wanted) < 1.0)
++        return true;
++
++      // The reader moved the two apart: the difference between its two times is the one that
++      // holds.
++      if (std::abs(found) <= MAX_LAYER_APART * 1e6)
++      {
++        char value[80];
++        std::snprintf(value, sizeof(value), "%lld 1 1000000", std::llround(found));
++        usable = SetLayerTime(packet, value);
++      }
++    }
++  }
++  if (usable)
++    return true;
++
++  // never a difference that names another picture: when the entry cannot be changed, it goes
++  if (!SetLayerTime(packet, LAYER_TIME_UNUSABLE))
++    av_packet_side_data_remove(packet->side_data, &packet->side_data_elems,
++                               AV_PKT_DATA_STRINGS_METADATA);
++  m_counts.unusable++;
++  return false;
++}
++
++// Two packets are of the same access unit when their decoding times are the same: exactly for
++// two times of their own, within the slack when one of them follows from the unit before it.
++bool CDVLayerMerge::SameUnit(const Waiting& a, const Waiting& b)
++{
++  if (a.time == AV_NOPTS_VALUE || b.time == AV_NOPTS_VALUE)
++    return false;
++
++  const uint64_t apart = a.time > b.time
++                             ? static_cast<uint64_t>(a.time) - static_cast<uint64_t>(b.time)
++                             : static_cast<uint64_t>(b.time) - static_cast<uint64_t>(a.time);
++  return apart <= static_cast<uint64_t>(std::max(a.slack, b.slack));
++}
++
++bool CDVLayerMerge::After(const Waiting& enhancement, const Waiting& base)
++{
++  return enhancement.time != AV_NOPTS_VALUE && base.time != AV_NOPTS_VALUE &&
++         enhancement.time > base.time && !SameUnit(enhancement, base);
++}
++
++// Whether the enhancement layer is past the first base packet: it has a packet of a later time,
++// or the packet of a base packet that came later. The tracks have their access units in the same
++// order, so the packet of the first one would have come before those.
++bool CDVLayerMerge::Passed() const
++{
++  const Waiting& base = m_base.waiting.front();
++  return std::any_of(m_enhancement.waiting.begin(), m_enhancement.waiting.end(),
++                     [this, &base](const Waiting& packet)
++                     {
++                       const Waiting enhancement = Shifted(packet);
++                       return After(enhancement, base) ||
++                              std::any_of(m_base.waiting.begin() + 1, m_base.waiting.end(),
++                                          [&enhancement](const Waiting& later)
++                                          { return SameUnit(later, enhancement); });
++                     });
++}
++
++// Hades: a packet of the enhancement track with its decoding time less the offset (CONFIRM), the
++// time by which it pairs; a time that does not fit is not known.
++CDVLayerMerge::Waiting CDVLayerMerge::ShiftedBy(const Waiting& enhancement, int64_t offset)
++{
++  Waiting shifted = enhancement;
++  if (offset && shifted.time != AV_NOPTS_VALUE)
++  {
++    const bool fits = offset > 0 ? shifted.time >= std::numeric_limits<int64_t>::min() + 1 + offset
++                                 : shifted.time <= std::numeric_limits<int64_t>::max() + offset;
++    shifted.time = fits ? shifted.time - offset : AV_NOPTS_VALUE;
++  }
++  return shifted;
++}
++
++// Hades: two presentation times of the two tracks are the same picture time: exactly, or within the
++// rounding of the time base of the enhancement track taken to the one of the base track.
++bool CDVLayerMerge::SamePresentation(int64_t base, int64_t enhancement) const
++{
++  if (base == AV_NOPTS_VALUE || enhancement == AV_NOPTS_VALUE)
++    return false;
++  const bool converted = KnownTimeBase(m_timeBase) && KnownTimeBase(m_enhancementTimeBase) &&
++                         !SameTimeBase(m_timeBase, m_enhancementTimeBase);
++  const uint64_t apart = base > enhancement
++                             ? static_cast<uint64_t>(base) - static_cast<uint64_t>(enhancement)
++                             : static_cast<uint64_t>(enhancement) - static_cast<uint64_t>(base);
++  return apart <= (converted ? 1u : 0u);
++}
++
++// Hades: whether a packet holds a random-access picture. Only one that its container marks as a
++// key packet is looked into (once), so that the units of every packet are not walked through.
++bool CDVLayerMerge::IsRandomAccess(Waiting& waiting, int lengthSize)
++{
++  if (waiting.random < 0)
++    waiting.random = (waiting.packet->flags & AV_PKT_FLAG_KEY) &&
++                             RandomAccess(waiting.packet->data,
++                                          static_cast<size_t>(std::max(waiting.packet->size, 0)),
++                                          lengthSize)
++                         ? 1
++                         : 0;
++  return waiting.random == 1;
++}
++
++// Hades: see CONFIRM. True while the base packet at the front waits for the access units that tell
++// whether the offset of its random-access picture holds.
++bool CDVLayerMerge::LearnOffset(bool end)
++{
++  Waiting& base = m_base.waiting.front();
++  if (m_fromPresentation || base.checked || base.pts == AV_NOPTS_VALUE ||
++      base.time == AV_NOPTS_VALUE)
++    return false;
++  if (!IsRandomAccess(base, m_base.lengthSize))
++  {
++    base.checked = true;
++    return false;
++  }
++  const int64_t most =
++      KnownTimeBase(m_timeBase) ? av_rescale(MAX_OFFSET, m_timeBase.den, m_timeBase.num) : 0;
++  // The enhancement packets in decoding order: those that left the queue last (m_seen), then the
++  // queue. The one of a random-access picture presented with the base packet: in the queue (it may
++  // still come: then this is looked at again while the base packet waits), or, with the
++  // enhancement layer ahead, taken already by a base packet before this one.
++  std::deque<Waiting>& layer = m_enhancement.waiting;
++  const size_t seen = m_seen.size();
++  const size_t total = seen + layer.size();
++  const auto entry = [this, &layer, seen](size_t n)
++  {
++    if (n >= seen)
++      return layer[n - seen];
++    Waiting w;
++    w.time = m_seen[n].time;
++    w.slack = m_seen[n].slack;
++    w.pts = m_seen[n].pts;
++    return w;
++  };
++  size_t first = total;
++  for (size_t i = 0; i < layer.size() && first == total; ++i)
++  {
++    if (layer[i].time != AV_NOPTS_VALUE && SamePresentation(base.pts, layer[i].pts) &&
++        IsRandomAccess(layer[i], m_enhancement.lengthSize))
++      first = seen + i;
++  }
++  for (size_t i = seen; i-- > 0 && first == total;)
++  {
++    if (m_seen[i].random && m_seen[i].time != AV_NOPTS_VALUE &&
++        SamePresentation(base.pts, m_seen[i].pts))
++      first = i;
++  }
++  if (first == total)
++  {
++    // None yet. The enhancement packet that it pairs with now: where that is of a random-access
++    // picture too, both layers start a group of pictures at this offset, and there is nothing to
++    // look for. Where it is not, an enhancement layer that is behind in decoding time brings the
++    // packet of the same picture later, after the one it pairs with now: the base packet waits
++    // for the enhancement packets of up to MAX_OFFSET seconds after its decoding time. (Where it
++    // pairs with none yet, it waits as it always does, and this is looked at again.)
++    const auto now = std::find_if(layer.begin(), layer.end(), [this, &base](const Waiting& e)
++                                  { return SameUnit(base, Shifted(e)); });
++    if (now == layer.end())
++      return false;
++    const Waiting last = Shifted(layer.back());
++    const bool reached = most <= 0 || last.time == AV_NOPTS_VALUE ||
++                         base.time > std::numeric_limits<int64_t>::max() - most ||
++                         last.time >= base.time + most;
++    if (!IsRandomAccess(*now, m_enhancement.lengthSize) && !reached && !end &&
++        m_silent < m_silentAfter && m_base.waiting.size() < MAX_WAITING &&
++        layer.size() < MAX_QUEUED)
++      return true;
++    base.checked = true;
++    return false;
++  }
++
++  const int64_t taken = entry(first).time;
++  const bool fits = base.time >= 0 ? taken >= std::numeric_limits<int64_t>::min() + base.time
++                                   : taken <= std::numeric_limits<int64_t>::max() + base.time;
++  const int64_t offset = fits ? taken - base.time : 0;
++  if (!fits || offset == m_offset || most <= 0 || offset > most || offset < -most)
++  {
++    base.checked = true;
++    return false;
++  }
++
++  // the CONFIRM access units after the two, pairwise presented at the same time and of the same
++  // access unit by that offset
++  const size_t have = std::min(m_base.waiting.size() - 1, total - 1 - first);
++  if (have < CONFIRM && !end && m_silent < m_silentAfter && m_base.waiting.size() < MAX_WAITING &&
++      layer.size() < MAX_QUEUED)
++    return true;
++  bool same = have >= CONFIRM;
++  for (size_t k = 1; same && k <= CONFIRM; ++k)
++    same = SamePresentation(m_base.waiting[k].pts, entry(first + k).pts) &&
++           SameUnit(m_base.waiting[k], ShiftedBy(entry(first + k), offset));
++  base.checked = true;
++  if (!same)
++  {
++    m_counts.unconfirmed++;
++    return false;
++  }
++  m_offset = offset;
++  m_counts.offset = offset;
++  m_counts.offsets++;
++  return false;
++}
++
++// Hades: an enhancement packet leaves the queue (joined, or dropped): what LearnOffset() looks at
++// of it is kept (CONFIRM).
++void CDVLayerMerge::Remember(Waiting& enhancement)
++{
++  if (m_fromPresentation)
++    return;
++  m_seen.push_back({enhancement.time, enhancement.slack, enhancement.pts,
++                    IsRandomAccess(enhancement, m_enhancement.lengthSize)});
++  if (m_seen.size() > SEEN)
++    m_seen.pop_front();
++}
++
++bool CDVLayerMerge::Pop(AVPacket* packet, bool end)
++{
++  if (m_verification == Verification::PENDING &&
++      (end || m_silent >= m_silentAfter || m_base.waiting.size() >= MAX_WAITING))
++  {
++    // what the first packets would say did not come: no pair
++    m_verification = Verification::REFUSED;
++    m_verifyDone = true;
++  }
++  if (m_verification == Verification::REFUSED)
++    return PopRefused(packet);
++  // base packets wait while it is not known whether the tracks are a pair
++  if (m_verification == Verification::PENDING)
++    return false;
++
++  if (end)
++  {
++    // no more packets come to make the times of the last ones
++    GiveTimes(m_base, 0);
++    GiveTimes(m_enhancement, 0);
++  }
++  if (m_base.waiting.empty())
++    return false;
++
++  Waiting base = m_base.waiting.front();
++  // its time comes with the packets of its track that follow it
++  if (base.pending)
++    return false;
++  // the enhancement track starts: its first packets get their times from the base track
++  const bool starting = Backfill();
++  if (starting && !end && m_base.waiting.size() < MAX_WAITING)
++    return false;
++  // Hades: the offset of the decoding times of the two tracks (CONFIRM)
++  if (LearnOffset(end))
++    return false;
++
++  const auto match = std::find_if(m_enhancement.waiting.begin(), m_enhancement.waiting.end(),
++                                  [this, &base](const Waiting& enhancement)
++                                  { return SameUnit(base, Shifted(enhancement)); });
++
++  if (match == m_enhancement.waiting.end())
++  {
++    // Its enhancement packet may still come; but a packet whose time is not known has none, and
++    // an enhancement layer that brought SetSilent() packets without a picture to start at gives
++    // none a time (REORDER).
++    const bool unstarted = m_fromPresentation && !m_enhancement.started &&
++                           m_enhancement.unstarted >= m_silentAfter;
++    if (base.time != AV_NOPTS_VALUE && !end && m_silent < m_silentAfter && !unstarted &&
++        m_base.waiting.size() < MAX_WAITING && !Passed())
++      return false;
++
++    m_counts.alone++;
++  }
++  else
++  {
++    m_counts.waited = std::max(m_counts.waited, m_base.waiting.size());
++    m_counts.queued = std::max(m_counts.queued, m_enhancement.waiting.size());
++
++    // what the enhancement layer has before it belongs to base packets that are gone
++    for (auto it = m_enhancement.waiting.begin(); it != match; ++it)
++    {
++      Remember(*it);
++      av_packet_free(&it->packet);
++      m_counts.dropped++;
++      if (!m_joinedSinceClear)
++        m_counts.droppedFirst++;
++    }
++    m_joinedSinceClear = true;
++    Remember(*match);
++    AVPacket* enhancement = match->packet;
++    m_enhancement.waiting.erase(m_enhancement.waiting.begin(), match + 1);
++
++    if (Append(base.packet, enhancement->data, static_cast<size_t>(std::max(enhancement->size, 0)),
++               m_base.lengthSize, m_enhancement.lengthSize))
++    {
++      m_counts.joined++;
++      AttachLayerTime(base.packet, enhancement->pts);
++    }
++    else
++    {
++      m_counts.malformed++;
++      m_counts.alone++;
++    }
++    av_packet_free(&enhancement);
++  }
++
++  m_base.waiting.pop_front();
++  av_packet_move_ref(packet, base.packet);
++  av_packet_free(&base.packet);
++  return true;
++}
++
++int CDVLayerMerge::Read(AVFormatContext* context, int base, int enhancement, AVPacket* packet)
++{
++  if (base >= 0 && enhancement >= 0 && static_cast<unsigned int>(base) < context->nb_streams &&
++      static_cast<unsigned int>(enhancement) < context->nb_streams)
++    SetTimeBases(context->streams[base]->time_base, context->streams[enhancement]->time_base);
++
++  while (true)
++  {
++    if (Pop(packet, m_end))
++      return 0;
++
++    const int result = av_read_frame(context, packet);
++    if (result == AVERROR_EOF && !m_end)
++    {
++      // what waits goes out first; the next read reports the end again
++      m_end = true;
++      continue;
++    }
++    m_end = false;
++    if (result < 0)
++      return result;
++
++    // no pair (an unverified one that its packets refused): every packet as it is read
++    if (m_verification == Verification::REFUSED && Empty())
++      return 0;
++    if (packet->stream_index == base)
++      PushBase(packet);
++    else if (packet->stream_index == enhancement)
++      PushEnhancement(packet);
++    else
++      return 0;
++  }
++}
+diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.h
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.h	1970-01-01 08:00:00
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.h	2026-11-23 11:53:23
+@@ -0,0 +1,521 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <deque>
++#include <functional>
++#include <string>
++#include <vector>
++
++extern "C"
++{
++#include <libavcodec/packet.h>
++#include <libavutil/avutil.h>
++#include <libavutil/dovi_meta.h>
++#include <libavutil/rational.h>
++}
++
++struct AVCodecParameters;
++struct AVFormatContext;
++struct dvbridge_rpu_probe;
++
++/*!
++ * \brief Joins the two video tracks of a Dolby Vision stream into the one-track form
++ *
++ * Dolby Vision profile 7 can come in two video tracks: the base layer, and the enhancement layer
++ * with the RPU. UHD Blu-ray carries it so in its transport stream, Matroska files made of a disc
++ * may keep the two tracks, and MP4 files have them so in the dual-track carriage of Dolby's
++ * specification (Annex C of "Dolby Vision Streams Within the ISO Base Media File Format"). A
++ * player that opens the first video track plays HDR10. Everything after the demuxer (the decoder,
++ * the split and the pairing of the layers) takes the one-track form that dovi_tool makes of the
++ * two and that one-track Matroska files carry: after the units of the base layer of an access unit
++ * come the units of the enhancement layer, each inside a unit of type 63, and the RPU, a unit of
++ * type 62, as it is.
++ *
++ * This class finds the two tracks and makes that form while the stream is read. The two tracks
++ * have their access units in the same order and with the same decoding times (not the same
++ * presentation times: the layers may be coded with different picture orders, which the pairing
++ * of the decoded pictures resolves; for it a joined packet says when its enhancement access
++ * unit is presented, see LAYER_TIME). An access unit that has no time of its own (a PES packet may
++ * hold more than one) has the time that follows from the unit before it in its track: that time
++ * plus that duration. Matroska gives no decoding times at all; there the time by which two packets
++ * pair is made from the presentation times of each track (see REORDER). The times of the
++ * enhancement track are taken to the time base of the base track.
++ *
++ * (Hades) Where the container gives decoding times, the two tracks may also have them a constant
++ * apart: the same pictures in the same order, each layer with a decoding delay of its own (an
++ * MP4 file gives each track its own decoding times; a disc may be so, see the case CroqueMr found
++ * after a seek). Paired by equal decoding times, every base packet would then get the
++ * enhancement access unit of another picture, and the first ones of the enhancement layer after
++ * the start or a seek, with its random-access picture, would be dropped. The difference is
++ * learned (see CONFIRM) and the packets of the enhancement track pair by their decoding time less
++ * it; until it is learned, and in a stream whose layers are not in the same order, it is 0.
++ *
++ * A base packet waits for the enhancement packet of its decoding time and goes out alone when the
++ * enhancement layer has none for it:
++ * - the enhancement layer is already past it;
++ * - the enhancement layer is silent: no packet of it came while as many base packets came as
++ *   SetSilent() says (base packets then do not wait at all until it is back);
++ * - MAX_WAITING base packets wait;
++ * - the stream ended;
++ * - its time is not known.
++ * How far apart a multiplexer puts the two packets of an access unit is not known for real discs,
++ * hence no fixed short wait: while the enhancement layer keeps coming, a base packet waits for
++ * its own.
++ *
++ * The units of both tracks are framed as their container frames them: start codes (Annex B) in a
++ * transport stream; in MP4 and Matroska a length before each unit, with an hvcC record. A joined
++ * packet keeps the framing of the base track. No part of this depends on Kodi, so that the same
++ * file is tested outside of it.
++ */
++class CDVLayerMerge
++{
++public:
++  CDVLayerMerge() = default;
++  ~CDVLayerMerge();
++  CDVLayerMerge(const CDVLayerMerge&) = delete;
++  CDVLayerMerge& operator=(const CDVLayerMerge&) = delete;
++
++  //! \brief The containers whose two tracks are joined
++  enum class Container
++  {
++    NONE,
++    TRANSPORT_STREAM,
++    MP4,
++    MATROSKA,
++  };
++
++  //! \brief What Find() found
++  struct Layers
++  {
++    enum class Result
++    {
++      NONE, //!< no pair of tracks
++      JOINED, //!< a pair that is joined
++      FRAMING, //!< a pair whose units are not framed as its container frames them: not joined
++      WRONG_SIZE, //!< a pair whose second track has not the size of an enhancement layer
++    };
++    Result result = Result::NONE;
++    Container container = Container::NONE;
++    int base = -1; //!< stream index of the base layer of the pair (joined or not)
++    int enhancement = -1; //!< stream index of its enhancement layer
++    //! known by the Dolby Vision record of the enhancement track; else (a disc) by the stream
++    //! numbers that the Blu-ray format gives to the two layers
++    bool described = false;
++    AVRational rate{0, 1}; //!< frame rate of the base layer, 0 when not known
++    AVDOVIDecoderConfigurationRecord record{}; //!< of the one-track form, when joined
++    //! bytes of the length before each unit of each track; 0: start codes
++    int baseLengthSize = 0;
++    int enhancementLengthSize = 0;
++    //! the container gives the packets their decoding times (a transport stream, MP4); Matroska
++    //! does not
++    bool decodingTimes = true;
++    //! What the container says is enough. False: two Matroska tracks that libavformat does not
++    //! group (no record, or records that do not tell which is which); they are a pair only once
++    //! their packets show it (Verification()), and the record is made for that case.
++    bool verified = true;
++    //! when not joined: why, in words for the log (a static string; empty when the stream has no
++    //! second video track to speak of)
++    const char* reason = "";
++  };
++
++  /*!
++   * \brief Look for the two tracks in the stream groups that libavformat makes of them
++   *
++   * libavformat groups them by the Dolby Vision descriptor of the enhancement track of a
++   * transport stream, or by the stream numbers of a Blu-ray stream; by the 'vdep' reference of
++   * an MP4 enhancement track with its record, in a Dolby Vision sample entry or (Hades,
++   * ffmpeg-9930) in an HEVC one ('hvc1', 'hev1') with a reference to one track only; and in Matroska,
++   * which has no such reference, by the Dolby Vision record of the enhancement track when there
++   * is exactly one other HEVC track. For MP4 and Matroska the enhancement track must also have
++   * the size of an enhancement layer of the base track.
++   *
++   * Matroska files with the two tracks of a disc are not all made so: older ones have no record
++   * at all (the enhancement layer is found by its RPUs, which a muxer that did not read them did
++   * not see), or one that calls the enhancement layer profile 8 (a MEL, whose RPUs say that it
++   * carries no residual), or the same record on both tracks. Where libavformat makes no group of
++   * a Matroska file with exactly two HEVC tracks, one of the size of an enhancement layer of the
++   * other, and no record that speaks against it, the pair is found unverified (Layers::verified):
++   * it is one only if the first packets of the second track have an RPU, and the ones of the
++   * first track have none. (Hades) So is a Matroska group the wrong way round, whose
++   * "enhancement" track is the larger one: libavformat takes the track with the record as the
++   * enhancement layer, and some files have the record on the base track alone (a one-track
++   * Dolby Vision file with a second HEVC track is grouped alike, and its packets refuse it).
++   * \param program index of the program that plays; any other value: all streams play
++   */
++  static Layers Find(AVFormatContext* context, unsigned int program);
++
++  /*!
++   * \brief Hades: the line of the log for a pair of tracks whose second one has not the size of an
++   *        enhancement layer for the first (Layers::Result::WRONG_SIZE)
++   * \param base, enhancement the stream indexes of the pair as the container groups it
++   *
++   * The line said "the base layer plays alone" in every case. Two tracks of the same size (above
++   * 1920x1080: a pair of that size is joined) are two whole pictures, such as a file with a Dolby
++   * Vision video stream and an HDR10 or HDR10+ one of the same picture: neither is a base layer
++   * nor an enhancement layer, and each plays as a video stream of its own, as do two tracks of
++   * other sizes.
++   */
++  static std::string WrongSizeReason(
++      int base, int enhancement, int baseWidth, int baseHeight, int width, int height)
++  {
++    const std::string first = std::to_string(base);
++    const std::string second = std::to_string(enhancement);
++    if (baseWidth == width && baseHeight == height)
++      return "CDVDDemuxFFmpeg: streams " + first + " and " + second +
++             " are two video tracks of the same size (" + std::to_string(width) + "x" +
++             std::to_string(height) +
++             ") that the container groups as Dolby Vision: two whole pictures, not a base layer "
++             "and its enhancement layer. Not joined: each plays as a video stream of its own";
++    return "CDVDDemuxFFmpeg: the second HEVC track of this stream (stream " + second + ", " +
++           std::to_string(width) + "x" + std::to_string(height) +
++           ") does not have the size of a Dolby Vision enhancement layer for the base layer of "
++           "stream " +
++           first + " (" + std::to_string(baseWidth) + "x" + std::to_string(baseHeight) +
++           "): not joined, each plays as a video stream of its own";
++  }
++
++  /*!
++   * \brief The record of a stream that no Dolby Vision record declares, from what an access unit
++   *        of it says (dvbridge_rpu_probe_packet())
++   *
++   * Only what can be told for sure: profile 7 where the stream carries both layers (units of type
++   * 63) and its RPU is the one of profile 7; profile 5; profile 8 with a base layer of
++   * PQ and BT.2020 (compatibility 1), HLG (4) or SDR BT.709 (2). Nothing else: an RPU of a full
++   * enhancement layer without that layer in the stream (it is in another track, or missing),
++   * profile 4, or a base layer whose signal is not one of those.
++   * \param parameters of the stream: its size and colour
++   * \return false when the stream is not to be taken as Dolby Vision
++   */
++  struct RpuProbe
++  {
++    bool rpu = false;
++    bool layer = false;
++    unsigned int rpu_profile = 0;
++    unsigned int vdr_bit_depth = 0;
++    bool bl_full_range = false;
++    bool el_resampling = false;
++    bool residual_disabled = false;
++    unsigned int profile = 0;
++  };
++  static void ProbeRpu(const uint8_t* data, size_t size, int lengthSize, RpuProbe& out);
++
++  static bool RecordFromRpu(const RpuProbe& probe,
++                            const AVCodecParameters* parameters,
++                            AVRational rate,
++                            AVDOVIDecoderConfigurationRecord& record);
++
++  //! \brief What the packets of an unverified pair said (Layers::verified)
++  enum class Verification
++  {
++    VERIFIED, //!< a pair, or one whose container said so
++    PENDING, //!< not known yet: base packets wait, as they wait for their enhancement packets
++    REFUSED, //!< no pair: what waits goes out as it was read, then every packet as it is read
++  };
++  Verification GetVerification() const { return m_verification; }
++
++  //! \brief No packet waits (after a refusal, the join can be left)
++  bool Empty() const { return m_base.waiting.empty() && m_enhancement.waiting.empty(); }
++
++  //! packets of the second track that may come before one with an RPU, when a pair is verified
++  static constexpr unsigned int VERIFY_PACKETS = 4;
++
++  /*!
++   * \brief The framing of a track: the bytes of the length before each unit when its codec
++   *        parameters have an hvcC record, 0 for start codes. As libavcodec tells them apart: such
++   *        a record starts with its version, 1.
++   */
++  static int LengthSize(const AVCodecParameters* parameters);
++
++  /*!
++   * \brief Whether these bytes are an hvcC record that the decoder of the enhancement layer can
++   *        take as its configuration (the one of the enhancement track of a pair in MP4 or
++   *        Matroska, which may hold its parameter sets)
++   */
++  static bool IsConfigurationRecord(const uint8_t* data, int size);
++
++  //! \brief Take what Find() found of the pair that is read: its rate, framing and times
++  void Configure(const Layers& layers);
++
++  /*!
++   * \brief av_read_frame() with the two tracks joined
++   *
++   * The packets of the base track come with the enhancement layer of their access unit, the ones
++   * of the enhancement track do not come, all others come as they are. At the end of the input
++   * what waits comes first.
++   */
++  int Read(AVFormatContext* context, int base, int enhancement, AVPacket* packet);
++
++  struct Counts
++  {
++    uint64_t joined = 0; //!< base packets that went out with their enhancement layer
++    uint64_t alone = 0; //!< base packets that went out without one
++    uint64_t dropped = 0; //!< enhancement packets that belonged to no base packet
++    uint64_t malformed = 0; //!< enhancement packets that could not be read as units
++    uint64_t unusable = 0; //!< joined packets whose LAYER_TIME the reader could not use
++    size_t waited = 0; //!< the most base packets that waited when one was joined
++    size_t queued = 0; //!< the most enhancement packets that waited when one was joined
++    //! Hades: of dropped, those before the first access unit joined after the start or a seek
++    uint64_t droppedFirst = 0;
++    //! Hades: the decoding times of the enhancement track less those of the base track, in the
++    //! time base of the base track, as last learned (0: none, or not learned; see CONFIRM)
++    int64_t offset = 0;
++    uint64_t offsets = 0; //!< Hades: offsets learned that differ from the one before
++    //! Hades: random-access pictures of both layers presented at the same time, at another offset
++    //! than the one in use, whose access units after them were not presented at the same times:
++    //! nothing learned (layers coded in different orders)
++    uint64_t unconfirmed = 0;
++  };
++
++  /*!
++   * \brief Take a packet of the base layer, or of the enhancement layer
++   * \param packet moved from; blank afterwards
++   * \return false when there was no memory (the packet is then dropped)
++   */
++  bool PushBase(AVPacket* packet);
++  bool PushEnhancement(AVPacket* packet);
++
++  /*!
++   * \brief The next packet of the base layer, with the enhancement layer of its access unit
++   * \param packet a blank packet, filled
++   * \param end no more packets come: what waits goes out as it is
++   * \return false when more packets have to be read first
++   */
++  bool Pop(AVPacket* packet, bool end);
++
++  //! \brief Forget what waits (a seek, a flush)
++  void Clear();
++
++  //! \brief Clear(), and forget what the packets of an unverified pair said (another pair)
++  void Restart();
++
++  const Counts& GetCounts() const { return m_counts; }
++
++  /*!
++   * \brief The key, in the strings metadata of a joined packet, of the presentation time of its
++   *        enhancement access unit
++   *
++   * The value is "<difference to the presentation time of the packet> <numerator> <denominator>",
++   * the last two being the time base of the difference (as the join writes it, that of the base
++   * track). The pictures of the two layers of a packet are not always presented together, and
++   * with this the pairing of the decoded pictures does not have to work out from the picture
++   * orders which ones are. A difference, so that it stays right when the reader moves the times
++   * of the packets; where a reader does not move all of them alike, see CheckLayerTime(). A
++   * packet has none when one of the two times is not known, the time bases are not known, or
++   * the times are more than MAX_LAYER_APART seconds apart, which is no reordering but a damaged
++   * time. The same text as DVBRIDGE_FEL_LAYER_TIME of tools/dvbridge/dvbridge_fel.h.
++   */
++  static constexpr char LAYER_TIME[] = "dvbridge_layer_time";
++  static constexpr int MAX_LAYER_APART = 10;
++  //! The value of LAYER_TIME for an access unit that has a time which the reader cannot use
++  //! (DVBRIDGE_FEL_LAYER_TIME_UNUSABLE)
++  static constexpr char LAYER_TIME_UNUSABLE[] = "-";
++
++  //! \brief The time bases of the two tracks, for LAYER_TIME. Read() sets them.
++  void SetTimeBases(AVRational base, AVRational enhancement);
++
++  /*!
++   * \brief Whether LAYER_TIME of a packet holds for the times that the reader makes
++   * \param packet a packet of the base layer, as Read() gave it
++   * \param microseconds the time that the reader gives to a time of the base track
++   *
++   * The difference between two times of the stream is the difference between the two times of
++   * the reader only where the reader moves both alike. Kodi's demuxer takes the start time of
++   * the file off every time after it, makes 0 of a time up to half a second before it, and
++   * leaves an earlier one as it is: for a packet on one side of the start whose enhancement
++   * access unit is presented on the other, the difference names another picture. Such a packet
++   * gets the difference between the two times of the reader. When the access unit is
++   * presented where the reader makes one time of many (within that half second: pictures that
++   * lead the first random-access picture of a file that was cut), no time names its picture:
++   * the packet gets LAYER_TIME_UNUSABLE, and is counted.
++   * \return false when the packet got LAYER_TIME_UNUSABLE
++   */
++  bool CheckLayerTime(AVPacket* packet, const std::function<double(int64_t)>& microseconds);
++
++  static constexpr size_t MAX_WAITING = 240; //!< base packets that wait for their enhancement
++  static constexpr size_t MAX_QUEUED = 240; //!< enhancement packets kept
++  static constexpr unsigned int SILENT = 60; //!< base packets without any enhancement packet
++
++  /*!
++   * \brief For the times that are made from the presentation times (Matroska): how many
++   *        pictures of a track may precede a picture in decoding order and follow it in output
++   *        order, at most
++   *
++   * Each track presents one picture at each time. From a random-access picture of a track on,
++   * the n-th of the times that its packets present, in order, is therefore the same for the n-th
++   * access unit from there in both tracks, also where the base and the enhancement picture of an
++   * access unit are presented at different times; it is the time by which the two packets of that
++   * access unit pair. It is known once REORDER more packets of the track came. HEVC allows 15
++   * (sps_max_num_reorder_pics); one more changes nothing but how long a packet waits for its
++   * time. The packets of a track before its first random-access picture (after a seek) have no
++   * time of their own. For the enhancement track those are the access units just before its
++   * first random-access one, in order: they get the times of the base packets just before the
++   * base packet of that one, and with them the base pictures their RPUs, as in a transport stream
++   * (their pictures cannot be decoded, their RPUs are the metadata of the pictures). Base packets
++   * wait for that, but not for an enhancement layer that brought as many packets as SetSilent()
++   * says without a random-access picture (no layer starts that late).
++   */
++  static constexpr size_t REORDER = 16;
++
++  /*!
++   * \brief (Hades) For the times of a container that gives decoding times: how the difference
++   *        between the decoding times of the two tracks is learned
++   *
++   * At a base packet of a random-access picture, when the enhancement track has a packet of a
++   * random-access picture presented at the same time: that is the access unit of the base packet
++   * where the two layers have their pictures in the same order, and then so are the CONFIRM
++   * access units after it in each track, pairwise presented at the same times. Only then is the
++   * difference between the decoding times of the two packets taken (at most MAX_OFFSET seconds);
++   * the base packet waits for those packets where it is not the difference in use. Where the
++   * enhancement packet that it pairs with by the difference in use is no random-access one, the
++   * one of its picture may come later (an enhancement layer behind): the base packet waits for
++   * the enhancement packets of up to MAX_OFFSET seconds after it. Where the enhancement layer is
++   * ahead and the offset is not learned yet (its first random-access picture did not tell it, or
++   * it changed), the base packet before the random-access one has already taken the enhancement
++   * packet of its picture: so the enhancement packets that left the queue are kept in short
++   * (SEEN), and the picture and the access units after it are looked for there too. Two layers
++   * coded in different orders (the two-track test stream of Hades: the same decoding times, and
++   * random-access pictures of the two layers at other access units, one of them presented at the
++   * time of one of the other layer) give no run of times, and nothing is learned. The difference
++   * stays after a seek (Clear(); it is checked again at the next such picture) and goes with
++   * Restart().
++   */
++  static constexpr size_t CONFIRM = 4;
++  static constexpr int MAX_OFFSET = 1;
++  //! Hades: the enhancement packets that left the queue last that are kept for that (CONFIRM): a
++  //! second of them at 120 pictures a second, with CONFIRM more
++  static constexpr size_t SEEN = 256;
++
++  /*!
++   * \brief After how many base packets without any enhancement packet the enhancement layer is
++   *        silent
++   *
++   * It is how long the first base packets wait at the start when the stream has no enhancement
++   * packets at all (after that the layer counts as absent, and nothing waits until a packet of
++   * it comes), so it should stay well below what the player keeps queued.
++   * \param packets taken between SILENT and MAX_WAITING - 1
++   */
++  void SetSilent(unsigned int packets);
++
++  //! \brief SetSilent() for two and a half seconds of a base layer of this frame rate
++  void SetRate(AVRational rate);
++
++  /*!
++   * \brief Append the units of an enhancement-layer access unit to a base-layer packet
++   * \param baseLengthSize framing of the base packet, and of what is appended: the bytes of the
++   *        length before each unit, 0 for start codes
++   * \param enhancementLengthSize framing of the enhancement access unit
++   * \return false when the enhancement layer is not a sequence of units, has a unit of type 63
++   *         (no enhancement layer has one: such a track would be the one-track form itself), a
++   *         unit does not fit the length of the base framing, or there is no memory; the base
++   *         packet is then unchanged
++   */
++  static bool Append(AVPacket* base,
++                     const uint8_t* enhancement,
++                     size_t size,
++                     int baseLengthSize = 0,
++                     int enhancementLengthSize = 0);
++
++  /*!
++   * \brief The level of a Dolby Vision stream (Dolby Vision Profiles and Levels): the first one
++   *        whose pixel rate and width hold the stream
++   * \return 0 when the size or the rate is not known, or no level holds it
++   */
++  static uint8_t Level(int width, int height, AVRational rate);
++
++  /*!
++   * \brief Whether a track can be the profile 7 enhancement layer of a base layer, by its size
++   *
++   * It has a quarter of the picture of the base layer, or the same picture when the base layer
++   * is no larger than 1920x1080. A size that is not known does not speak against it.
++   */
++  static bool EnhancementSize(int baseWidth, int baseHeight, int width, int height);
++
++private:
++  //! A packet that waits, with the decoding time of its access unit
++  struct Waiting
++  {
++    AVPacket* packet = nullptr;
++    int64_t time = 0; //!< in the time base of the base track; AV_NOPTS_VALUE when not known
++    int64_t slack = 0; //!< 0 for a time of its own; half a duration for one that follows
++    bool pending = false; //!< its time is made from presentation times and not known yet
++    //! a packet of the enhancement track before its first random-access packet, where the times
++    //! are made from presentation times: its time comes from the base track (Backfill())
++    bool early = false;
++    //! Hades: its presentation time, in the time base of the base track (AV_NOPTS_VALUE when not
++    //! known), and for a base packet whether it was looked at for the offset (CONFIRM)
++    int64_t pts = AV_NOPTS_VALUE;
++    bool checked = false;
++    int random = -1; //!< Hades: it holds a random-access picture (1) or not (0); -1: not looked at
++  };
++
++  //! The packets of a track that wait, and what gives the next one its time when it has none
++  struct Track
++  {
++    std::deque<Waiting> waiting;
++    int64_t time = 0; //!< of the last packet read
++    int64_t duration = 0; //!< of the last packet read
++    bool known = false; //!< time and duration are of a packet read since the last Clear()
++    // times made from the presentation times (Matroska):
++    bool started = false; //!< a random-access packet of the track came since the last Clear()
++    unsigned int unstarted = 0; //!< packets of the track before that one
++    std::vector<int64_t> presented; //!< a heap (least first) of the times not given yet
++    int lengthSize = 0; //!< framing of the units of the track, to find a random-access picture
++  };
++
++  bool Queue(Track& track, AVPacket* packet, bool enhancement);
++  void Verify(const AVPacket* packet, bool enhancement);
++  bool PopRefused(AVPacket* packet);
++  bool Backfill();
++  void GiveTimes(Track& track, size_t keep);
++  int64_t ToBase(int64_t time) const;
++  void AttachLayerTime(AVPacket* base, int64_t enhancementPts) const;
++  static bool SetLayerTime(AVPacket* packet, const char* value);
++  static void Forget(Track& track);
++  static bool SameUnit(const Waiting& a, const Waiting& b);
++  static bool After(const Waiting& enhancement, const Waiting& base);
++  bool Passed() const;
++  static Waiting ShiftedBy(const Waiting& enhancement, int64_t offset);
++  Waiting Shifted(const Waiting& enhancement) const { return ShiftedBy(enhancement, m_offset); }
++  bool SamePresentation(int64_t base, int64_t enhancement) const;
++  static bool IsRandomAccess(Waiting& waiting, int lengthSize);
++  bool LearnOffset(bool end);
++  void Remember(Waiting& enhancement);
++
++  Track m_base;
++  Track m_enhancement;
++  AVRational m_timeBase{0, 1}; //!< of the base track; not known: no LAYER_TIME
++  AVRational m_enhancementTimeBase{0, 1};
++  unsigned int m_silentAfter = SILENT;
++  unsigned int m_silent = 0; //!< base packets since the last enhancement packet
++  bool m_absent = false; //!< the layer went silent without ever having had a packet
++  bool m_any = false; //!< an enhancement packet has come
++  bool m_end = false; //!< the input ended and what waits is going out
++  bool m_fromPresentation = false; //!< the times are made from presentation times (REORDER)
++  Verification m_verification = Verification::VERIFIED;
++  unsigned int m_verifyLayer = 0; //!< packets of the second track probed without an RPU
++  unsigned int m_verifyBase = 0; //!< packets of the first track probed without one
++  bool m_layerRpu = false; //!< a packet of the second track had the RPU of a dual-layer stream
++  bool m_verifyDone = false; //!< the packets said it (VERIFIED or REFUSED)
++  int64_t m_offset = 0; //!< Hades: see CONFIRM
++  //! Hades: an enhancement packet that left the queue (joined or dropped), as LearnOffset() looks
++  //! at it: oldest first, at most SEEN, none from before the last Clear()
++  struct Seen
++  {
++    int64_t time;
++    int64_t slack;
++    int64_t pts;
++    bool random;
++  };
++  std::deque<Seen> m_seen;
++  bool m_joinedSinceClear = false; //!< Hades: an access unit was joined since the last Clear()
++  Counts m_counts;
++};

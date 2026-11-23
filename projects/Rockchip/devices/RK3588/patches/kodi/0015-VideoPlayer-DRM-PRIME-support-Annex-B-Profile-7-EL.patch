@@ -1,0 +1,84 @@
+From: momokind <momokind2002@gmail.com>
+Subject: [PATCH] VideoPlayer: DRM PRIME: support Annex B Profile 7 enhancement layer
+
+CDVLayerMerge joins dual-track Blu-ray transport stream Profile 7 packets
+in Annex B start-code framing (without hvcC extradata). Allow
+CDVELDecoderDRMPRIME::Create() when extradata is not hvcC (m_nalSize = 0)
+and split Annex B start-code packets into base layer (NAL != 63) and
+enhancement layer (NAL == 63, stripping the 2-byte 7e 01 wrapper).
+
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.cpp
+@@ -51,10 +51,8 @@ std::unique_ptr<CDVELDecoderDRMPRIME> CDVELDecoderDRMPRIME::Create(const CDVDSt
+       !hints.dovi.el_present_flag || !base->hw_device_ctx)
+     return nullptr;
+ 
+-  // single-track: the enhancement layer's NAL units are in the base layer's, as type 63
+   const uint8_t* extradata = static_cast<const uint8_t*>(hints.extradata.GetData());
+-  if (hints.extradata.GetSize() < 23 || extradata[0] != 1)
+-    return nullptr;
++  const bool hvcc = hints.extradata.GetSize() >= 23 && extradata[0] == 1;
+ 
+   const auto allowedHdrFormats = std::dynamic_pointer_cast<CSettingList>(
+       CServiceBroker::GetSettingsComponent()->GetSettings()->GetSetting(
+@@ -65,7 +63,7 @@ std::unique_ptr<CDVELDecoderDRMPRIME> CDVELDecoderDRMPRIME::Create(const CDVDSt
+     return nullptr;
+ 
+   std::unique_ptr<CDVELDecoderDRMPRIME> el(new CDVELDecoderDRMPRIME());
+-  el->m_nalSize = (extradata[21] & 3) + 1;
++  el->m_nalSize = hvcc ? (extradata[21] & 3) + 1 : 0;
+   el->m_decoder[0] = base;
+ 
+   const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
+@@ -112,7 +110,50 @@ AVPacket* CDVELDecoderDRMPRIME::LayerPacket(int layer, const AVPacket* packet) c
+     return nullptr;
+   }
+ 
+-  const int size = pi_p7_split(packet->data, packet->size, m_nalSize, layer, out->data, room);
++  int size = 0;
++  if (m_nalSize > 0)
++  {
++    size = pi_p7_split(packet->data, packet->size, m_nalSize, layer, out->data, room);
++  }
++  else
++  {
++    static constexpr uint8_t START[4] = {0, 0, 0, 1};
++    const uint8_t* const end = packet->data + packet->size;
++    auto findStart = [&](const uint8_t* p) -> const uint8_t*
++    {
++      while (p + 2 < end)
++      {
++        if (p[0] == 0 && p[1] == 0 && (p[2] == 1 || (p + 3 < end && p[2] == 0 && p[3] == 1)))
++          return p;
++        ++p;
++      }
++      return end;
++    };
++    for (const uint8_t* p = findStart(packet->data); p < end;)
++    {
++      const size_t sc = p[2] == 1 ? 3 : 4;
++      const uint8_t* unit = p + sc;
++      const uint8_t* next = findStart(unit);
++      const size_t len = static_cast<size_t>(next - unit);
++      if (len >= 2)
++      {
++        const int type = (unit[0] >> 1) & 63;
++        if (layer && type == 63 && len > 2 && size + 4 + static_cast<int>(len - 2) <= room)
++        {
++          std::memcpy(out->data + size, START, 4);
++          std::memcpy(out->data + size + 4, unit + 2, len - 2);
++          size += 4 + static_cast<int>(len - 2);
++        }
++        else if (!layer && type != 63 && size + 4 + static_cast<int>(len) <= room)
++        {
++          std::memcpy(out->data + size, START, 4);
++          std::memcpy(out->data + size + 4, unit, len);
++          size += 4 + static_cast<int>(len);
++        }
++      }
++      p = next;
++    }
++  }
+   if (size <= 0 || av_packet_copy_props(out, packet) < 0)
+   {
+     av_packet_free(&out);
