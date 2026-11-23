@@ -1,0 +1,229 @@
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.h
+@@ -20,10 +20,14 @@
+ struct pi_pairer;
+ 
+ /*!
+- * \brief The enhancement layer of a single-track Dolby Vision profile 7 stream
+- * for CDVDVideoCodecDRMPRIME: splits each packet into its two layers, decodes
+- * the enhancement layer with a second decoder and pairs the layers' pictures
+- * (libpi_engine's input glue).
++ * \brief The enhancement layer of a Dolby Vision profile 7 stream for
++ * CDVDVideoCodecDRMPRIME: decodes the enhancement layer with a second decoder
++ * and pairs its pictures with the base layer's (libpi_engine's input glue).
++ *
++ * Two carriages (Hades): one track, where the enhancement units are inside the
++ * base layer's packets and each packet is split into its two layers; and two
++ * tracks, where the enhancement layer comes in packets of its own
++ * (DemuxPacket::elData) and each layer's decoder is fed with its own.
+  */
+ class CDVELDecoderDRMPRIME
+ {
+@@ -40,6 +44,16 @@
+ 
+   //! \return as avcodec_send_packet(): AVERROR(EAGAIN) if a decoder is full
+   int SendPacket(const AVPacket* packet);
++  /*!
++   * \brief Two tracks: the enhancement layer's access unit of the base packet
++   *        being sent, unchanged (Hades)
++   *
++   * Never EAGAIN: a picture that its decoder cannot take waits here, and is
++   * dropped if yet another one comes while it waits (the pairer then drops its
++   * base picture too: no picture is decoded twice).
++   * \param pts the presentation time, in AV_TIME_BASE units
++   */
++  void SendLayer(const uint8_t* data, int size, int64_t pts);
+   //! \return as avcodec_receive_frame(), with the base layer's picture
+   int ReceiveFrame(AVFrame* frame);
+   //! \brief Gives the last received picture's enhancement layer to the buffer
+@@ -66,4 +80,8 @@
+   int m_nalSize = 4;
+   int m_queueSize = 0;
+   unsigned int m_logged[3] = {};
++  //! the enhancement layer comes in packets of its own (two tracks), not inside the base
++  //! layer's packets (one track)
++  bool m_separate = false;
++  bool m_droppedEL = false; //!< a picture was dropped because its decoder was behind
+ };
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.cpp
+@@ -56,8 +56,17 @@
+       !hints.dovi.el_present_flag || !base->hw_device_ctx)
+     return nullptr;
+ 
+-  const uint8_t* extradata = static_cast<const uint8_t*>(hints.extradata.GetData());
+-  const bool hvcc = hints.extradata.GetSize() >= 23 && extradata[0] == 1;
++  // (Hades) two tracks: the enhancement layer has packets of its own, framed as its track
++  // frames them, and its decoder opens with the codec configuration of that track (an hvcC
++  // record in MP4 and Matroska; a transport stream has the parameter sets in-band). One track:
++  // the units are split out of the base layer's packets, which carry that configuration in-band
++  // as well.
++  const bool separate = hints.doviEL;
++  const uint8_t* extradata = static_cast<const uint8_t*>(
++      separate ? hints.doviELExtradata.GetData() : hints.extradata.GetData());
++  const size_t extradataSize =
++      separate ? hints.doviELExtradata.GetSize() : hints.extradata.GetSize();
++  const bool hvcc = extradata && extradataSize >= 23 && extradata[0] == 1;
+ 
+   const auto allowedHdrFormats = std::dynamic_pointer_cast<CSettingList>(
+       CServiceBroker::GetSettingsComponent()->GetSettings()->GetSetting(
+@@ -68,6 +77,7 @@
+     return nullptr;
+ 
+   std::unique_ptr<CDVELDecoderDRMPRIME> el(new CDVELDecoderDRMPRIME());
++  el->m_separate = separate;
+   el->m_nalSize = hvcc ? (extradata[21] & 3) + 1 : 0;
+   el->m_decoder[0] = base;
+ 
+@@ -77,6 +87,18 @@
+   if (!decoder)
+     return nullptr;
+ 
++  // the framing of the enhancement layer's own packets (two tracks): the record tells the
++  // decoder the length before each unit; without one its packets are start-code units
++  if (separate && extradataSize > 0)
++  {
++    decoder->extradata =
++        static_cast<uint8_t*>(av_mallocz(extradataSize + AV_INPUT_BUFFER_PADDING_SIZE));
++    if (decoder->extradata)
++    {
++      decoder->extradata_size = static_cast<int>(extradataSize);
++      std::memcpy(decoder->extradata, extradata, extradataSize);
++    }
++  }
+   decoder->hw_device_ctx = av_buffer_ref(base->hw_device_ctx);
+   decoder->get_format = GetFormat;
+   decoder->time_base = base->time_base;
+@@ -95,7 +117,10 @@
+   if (!el->m_enhancementLayer)
+     return nullptr;
+ 
+-  CLog::Log(LOGINFO, "CDVELDecoderDRMPRIME: decoding the profile 7 enhancement layer");
++  CLog::Log(LOGINFO,
++            "CDVELDecoderDRMPRIME: decoding the profile 7 enhancement layer ({})",
++            separate ? "two tracks, from its own packets"
++                     : "one track, split from the base layer's packets");
+   return el;
+ }
+ 
+@@ -235,6 +260,10 @@
+ 
+ int CDVELDecoderDRMPRIME::SendPacket(const AVPacket* packet)
+ {
++  // two tracks: each layer has packets of its own (SendLayer()), nothing to split here
++  if (m_separate)
++    return 0;
++
+   // a layer's packet its decoder couldn't take goes first
+   for (int layer = 0; layer < 2; layer++)
+   {
+@@ -273,6 +302,46 @@
+   return 0;
+ }
+ 
++void CDVELDecoderDRMPRIME::SendLayer(const uint8_t* data, int size, int64_t pts)
++{
++  if (!m_decoder[1] || !data || size <= 0)
++    return;
++
++  // the picture held from before goes first; a decoder and a pairer that are still full mean
++  // this one cannot be kept too: it is dropped, and the pairer drops its base picture
++  if (m_pending[1])
++  {
++    const int ret = Send(1, m_pending[1]);
++    if (ret == AVERROR(EAGAIN))
++    {
++      if (!m_droppedEL)
++        CLog::Log(LOGDEBUG,
++                  "CDVELDecoderDRMPRIME: the enhancement layer is behind: its pictures are dropped");
++      m_droppedEL = true;
++      return;
++    }
++    av_packet_free(&m_pending[1]);
++    if (ret < 0)
++      return;
++  }
++
++  AVPacket* packet = av_packet_alloc();
++  if (!packet || av_new_packet(packet, size) < 0)
++  {
++    av_packet_free(&packet);
++    return;
++  }
++  std::memcpy(packet->data, data, static_cast<size_t>(size));
++  packet->pts = pts;
++  packet->dts = AV_NOPTS_VALUE;
++
++  const int ret = Send(1, packet);
++  if (ret == AVERROR(EAGAIN))
++    m_pending[1] = packet;
++  else
++    av_packet_free(&packet);
++}
++
+ void CDVELDecoderDRMPRIME::LogPairing()
+ {
+   pi_pair_stats stats;
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
+@@ -76,6 +76,10 @@
+   std::shared_ptr<CVideoBufferPoolDMA> m_swVideoBufferPool;
+ #if defined(HAVE_PIDV)
+   std::unique_ptr<CDVELDecoderDRMPRIME> m_dolbyVisionEL;
++  //! the enhancement layer comes in packets of its own (Dolby Vision profile 7 in two video
++  //! tracks): the base layer's packet goes to the base layer's decoder, the enhancement
++  //! layer's access unit that the demuxer put with it to the decoder of the enhancement layer
++  bool m_dvELSeparate{false};
+   bool m_dvFromHdrVivid{false};
+   int m_dvLengthSize{0};
+   struct hdrvivid_dovi_scene* m_dvHdrVividScene{nullptr};
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+@@ -411,6 +411,10 @@
+ 
+ #if defined(HAVE_PIDV)
+   m_dolbyVisionEL = CDVELDecoderDRMPRIME::Create(hints, m_pCodecContext);
++  // (Hades) two video tracks: the enhancement layer comes in packets of its own, which the
++  // demuxer puts in DemuxPacket::elData and the player sends to that decoder; one track: it is
++  // inside the base layer's packets, which that decoder splits
++  m_dvELSeparate = m_dolbyVisionEL && hints.doviEL;
+   m_dvFromHdrVivid = hints.doviFromHdrVivid && !m_dolbyVisionEL;
+   m_hdrVividT35Queue.clear();
+   hdrvivid_dovi_scene_destroy(m_dvHdrVividScene);
+@@ -492,7 +496,25 @@
+ 
+   int ret;
+ #if defined(HAVE_PIDV)
+-  if (m_dolbyVisionEL)
++  if (m_dolbyVisionEL && m_dvELSeparate)
++  {
++    // (Hades) two tracks: the base layer's packet, unchanged, to the base layer's decoder; the
++    // enhancement layer's access unit that came with it to the decoder of the enhancement
++    // layer, which pairs the two pictures by presentation time (pi_pairer). Only when the base
++    // decoder took its packet: a packet that has to be sent again must not send its
++    // enhancement layer twice.
++    ret = avcodec_send_packet(m_pCodecContext, avpkt);
++    if (ret == 0 && packet.elData && packet.elSize > 0)
++    {
++      const int64_t elPts =
++          packet.elPts == static_cast<int64_t>(AV_NOPTS_VALUE)
++              ? static_cast<int64_t>(AV_NOPTS_VALUE)
++              : static_cast<int64_t>(static_cast<double>(packet.elPts) / DVD_TIME_BASE *
++                                     AV_TIME_BASE);
++      m_dolbyVisionEL->SendLayer(packet.elData, packet.elSize, elPts);
++    }
++  }
++  else if (m_dolbyVisionEL)
+     ret = m_dolbyVisionEL->SendPacket(avpkt);
+   else
+ #endif
+@@ -570,7 +592,8 @@
+ 
+   int ret;
+ #if defined(HAVE_PIDV)
+-  if (m_dolbyVisionEL)
++  // (two tracks: the base decoder is the player's, as in the packets above)
++  if (m_dolbyVisionEL && !m_dvELSeparate)
+     ret = m_dolbyVisionEL->SendPacket(avpkt);
+   else
+ #endif
