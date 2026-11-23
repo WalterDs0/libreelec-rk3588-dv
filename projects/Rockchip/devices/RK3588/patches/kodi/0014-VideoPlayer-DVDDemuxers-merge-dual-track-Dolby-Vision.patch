@@ -9,20 +9,16 @@ with HAVE_PIDV / ENABLE_PIDV.
 diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/CMakeLists.txt b/xbmc/cores/VideoPlayer/DVDDemuxers/CMakeLists.txt
 --- a/xbmc/cores/VideoPlayer/DVDDemuxers/CMakeLists.txt	2026-11-10 06:45:49
 +++ b/xbmc/cores/VideoPlayer/DVDDemuxers/CMakeLists.txt	2026-11-23 11:53:23
-@@ -33,4 +33,13 @@
+@@ -33,4 +33,9 @@
              DVDDemuxVobsub.h
              DVDFactoryDemuxer.h)
  
-+if(ENABLE_DVBRIDGE)
++if(TARGET ${APP_NAME_LC}::PiDV)
 +  list(APPEND SOURCES DVLayerMerge.cpp)
 +  list(APPEND HEADERS DVLayerMerge.h)
 +endif()
 +
  core_add_library(dvddemuxers)
-+if(ENABLE_DVBRIDGE)
-+  # the probe of the RPU of a stream (dvbridge_probe.h)
-+  target_link_libraries(${CORE_LIBRARY} PRIVATE dvbridge_core)
-+endif()
 diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
 --- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp	2026-11-10 06:45:49
 +++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp	2026-11-23 12:19:05
