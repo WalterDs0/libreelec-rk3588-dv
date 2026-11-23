@@ -38,7 +38,7 @@ diff --git a/xbmc/application/Application.cpp b/xbmc/application/Application.cpp
 index 531130ca7..5afd24c7b 100644
 --- a/xbmc/application/Application.cpp
 +++ b/xbmc/application/Application.cpp
-@@ -1636,6 +1636,14 @@ void CApplication::FrameMove(bool processEvents, bool processGUI)
+@@ -1636,6 +1636,17 @@ void CApplication::FrameMove(bool processEvents, bool processGUI)
      if (!m_skipGuiRender && appPlayer->IsRenderingVideoLayer() &&
          !CServiceBroker::GetGUI()->GetWindowManager().HasDirtyRegions())
        m_skipGuiRender = true;
@@ -46,8 +46,11 @@ index 531130ca7..5afd24c7b 100644
 +    // A GUI composited into each picture by the video's renderer is drawn on the GPU the video
 +    // needs: during playback, draw it at most 12 times a second
 +    using namespace std::chrono_literals;
++    // never let the cap drop a dirty frame: the dirty regions age out by buffer age, so a
++    // skipped one is lost and the GUI (a busy dialog closing, say) would never redraw
 +    if (!m_skipGuiRender && CServiceBroker::GetWinSystem()->IsGuiCaptured() &&
 +        !appPlayer->IsPausedPlayback() &&
++        !CServiceBroker::GetGUI()->GetWindowManager().HasDirtyRegions() &&
 +        std::chrono::steady_clock::now() - m_lastRenderTime < 1000ms / 12)
 +      m_skipGuiRender = true;
      CServiceBroker::GetGUI()->GetWindowManager().FrameMove();

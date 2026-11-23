@@ -1,0 +1,30 @@
+From: edward <edward@users.noreply.github.com>
+Subject: [PATCH] planner: allow non-zero ext_mapping_idc in RPU metadata
+
+Some Profile 5 and Profile 8 CM v4.0 streams (e.g. DSNP WEB-DL) set
+ext_mapping_idc_0_4 / ext_mapping_idc_5_7 in the RPU header. Rejecting
+them in dv_ffmpeg_metadata.c and single_reshape_ffmpeg.c caused the
+planner to return DV_UNSUPPORTED (-2).
+
+--- a/engine/planner/dv_ffmpeg_metadata.c
++++ b/engine/planner/dv_ffmpeg_metadata.c
+@@ -111,7 +111,7 @@
+        (header.el_bit_depth!=10&&!(single&&sample_depth==8&&header.el_bit_depth==8))||
+        header.vdr_bit_depth!=12||header.disable_residual_flag>1||
+        header.el_spatial_resampling_filter_flag>1||header.bl_video_full_range_flag>1||
+-       header.chroma_resampling_explicit_filter_flag||header.ext_mapping_idc_0_4||header.ext_mapping_idc_5_7||
++       header.chroma_resampling_explicit_filter_flag||
+        mapping.mapping_color_space||mapping.mapping_chroma_format_idc||
+        color.signal_bit_depth!=12||(color.signal_color_space!=0&&(!source_transport||color.signal_color_space!=2))||color.signal_chroma_format!=0||
+        color.signal_full_range_flag!=1||color.signal_eotf!=65535||color.signal_eotf_param0||
+--- a/engine/planner/single_reshape_ffmpeg.c
++++ b/engine/planner/single_reshape_ffmpeg.c
+@@ -13,7 +13,7 @@
+     AVDOVIRpuDataHeader h;AVDOVIDataMapping mapping;const unsigned char *raw=data;
+     memcpy(&h,raw+metadata.header_offset,sizeof(h));memcpy(&mapping,raw+metadata.mapping_offset,sizeof(mapping));
+     if(h.coef_data_type||h.coef_log2_denom>32||h.bl_bit_depth<8||h.bl_bit_depth>12||
+-       h.vdr_bit_depth!=12||!dv_metadata_no_residual(&h,&mapping)||h.ext_mapping_idc_0_4||h.ext_mapping_idc_5_7||
++       h.vdr_bit_depth!=12||!dv_metadata_no_residual(&h,&mapping)||
+        mapping.mapping_color_space||mapping.mapping_chroma_format_idc)return -1;
+     dv_single_reshape result={0};result.base_depth=h.bl_bit_depth;result.denominator=h.coef_log2_denom;
+     unsigned maximum=(1u<<result.base_depth)-1;

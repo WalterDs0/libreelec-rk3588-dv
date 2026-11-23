@@ -1,0 +1,29 @@
+From: edward <edward@users.noreply.github.com>
+Subject: [PATCH] GBM: clear Dolby Vision signalling on InitWindowSystem
+
+A crash during Dolby Vision playback can leave the DRM connector
+signalling Dolby Vision while the GUI is SDR RGB. Reset Dolby Vision
+to OFF during WinSystemGbm::InitWindowSystem() and ensure OFF always
+runs even when m_dolbyVision is already OFF.
+
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -183,6 +183,8 @@
+ 
+   SetColorimetry(nullptr);
+   SetHDR(nullptr);
++  // a crash can leave the connector signalling Dolby Vision; the GUI is SDR RGB
++  SetDolbyVision(DolbyVisionOutput::OFF);
+ 
+   auto settingsComponent = CServiceBroker::GetSettingsComponent();
+   if (!settingsComponent)
+@@ -671,7 +673,8 @@
+   if (!connector || !connector->SupportsProperty("Dolby Vision"))
+     return output == DolbyVisionOutput::OFF;
+ 
+-  if (output == m_dolbyVision)
++  // Off always runs: a crash may have left the connector signalling (see InitWindowSystem)
++  if (output == m_dolbyVision && output != DolbyVisionOutput::OFF)
+     return true;
+ 
+   std::string_view name = "Off";
