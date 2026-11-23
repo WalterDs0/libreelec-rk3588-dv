@@ -1427,7 +1427,7 @@ diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.cpp
 +    return;
 +  RpuProbe probe;
 +  ProbeRpu(packet->data, static_cast<size_t>(std::max(packet->size, 0)),
-+                            enhancement ? m_enhancement.lengthSize : m_base.lengthSize, &probe);
++                            enhancement ? m_enhancement.lengthSize : m_base.lengthSize, probe);
 +  if (!enhancement)
 +  {
 +    if (probe.rpu || probe.layer)
