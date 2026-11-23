@@ -25,7 +25,7 @@ diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/CMakeLists.txt b
 +endif()
 diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
 --- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp	2026-11-10 06:45:49
-+++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp	2026-11-23 12:13:24
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp	2026-11-23 12:19:05
 @@ -58,6 +58,9 @@
  #include <libavutil/pixdesc.h>
  }
@@ -64,7 +64,7 @@ diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.c
  
    m_displayTime = 0;
    m_dtsAtDisplayTime = DVD_NOPTS_VALUE;
-@@ -1075,6 +1092,363 @@
+@@ -1075,6 +1092,361 @@
    return timestamp * DVD_TIME_BASE;
  }
  
@@ -217,9 +217,7 @@ diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.c
 +    return;
 +  video->hdr_type = StreamHdrType::HDR_TYPE_DOLBYVISION;
 +  video->dovi = record;
-+  if (enhancement &&
-+      CDVLayerMerge::IsConfigurationRecord(enhancement->extradata, enhancement->extradata_size))
-+    video->doviELConfig = FFmpegExtraData(enhancement->extradata, enhancement->extradata_size);
++  (void)enhancement;
 +  // VideoPlayer opens the codec of the stream again with what it is now (CheckStreamChanges())
 +  video->changes++;
 +}
@@ -428,7 +426,7 @@ diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.c
  DemuxPacket* CDVDDemuxFFmpeg::ReadInternal(bool keep)
  {
    DemuxPacket* pPacket = NULL;
-@@ -1098,8 +1472,11 @@
+@@ -1098,8 +1470,11 @@
  
          // timeout reads after 100ms
          m_timeout.Set(20s);
@@ -441,7 +439,7 @@ diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.c
        }
  
        if (m_pkt.result == AVERROR(EINTR) || m_pkt.result == AVERROR(EAGAIN))
-@@ -1201,6 +1578,23 @@
+@@ -1201,6 +1576,23 @@
            pPacket->duration = DVD_SEC_TO_TIME((double)m_pkt.pkt.duration * stream->time_base.num /
                                                stream->time_base.den);
  
@@ -465,7 +463,7 @@ diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.c
            CDVDDemuxUtils::StoreSideData(pPacket, &m_pkt.pkt);
  
            CDVDInputStream::IDisplayTime* inputStream = m_pInput->GetIDisplayTime();
-@@ -1284,6 +1678,9 @@
+@@ -1284,6 +1676,9 @@
        if (stream && stream->codec == AV_CODEC_ID_H264)
          pPacket->recoveryPoint = m_seekToKeyFrame;
        m_seekToKeyFrame = false;
@@ -475,7 +473,7 @@ diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.c
      }
      if (!stream)
      {
-@@ -1318,6 +1715,9 @@
+@@ -1318,6 +1713,9 @@
  
    m_pkt.result = -1;
    av_packet_unref(&m_pkt.pkt);
@@ -485,7 +483,7 @@ diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.c
  
    CDVDInputStream::IPosTime* ist = m_pInput->GetIPosTime();
    if (ist)
-@@ -1412,6 +1812,10 @@
+@@ -1412,6 +1810,10 @@
      else
        ret = av_seek_frame(m_pFormatContext, m_seekStream, seek_pts,
                            backwards ? AVSEEK_FLAG_BACKWARD : 0);
@@ -496,7 +494,7 @@ diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.c
  
      if (ret < 0)
      {
-@@ -1486,6 +1890,9 @@
+@@ -1486,6 +1888,9 @@
  
    m_pkt.result = -1;
    av_packet_unref(&m_pkt.pkt);
@@ -506,7 +504,7 @@ diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.c
  
    return (ret >= 0);
  }
-@@ -1651,6 +2058,9 @@
+@@ -1651,6 +2056,9 @@
      if (m_program != UINT_MAX)
      {
        m_pFormatContext->programs[m_program]->discard = AVDISCARD_NONE;
@@ -516,7 +514,7 @@ diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.c
  
        // add streams from selected program
        for (unsigned int i = 0; i < m_pFormatContext->programs[m_program]->nb_stream_indexes; i++)
-@@ -1675,9 +2085,15 @@
+@@ -1675,9 +2083,15 @@
    // if there were no programs or they were all empty, add all streams
    if (m_program == UINT_MAX)
    {
@@ -532,7 +530,7 @@ diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.c
  }
  
  void CDVDDemuxFFmpeg::SaveProbedStreamParameters()
-@@ -1823,6 +2239,12 @@
+@@ -1823,6 +2237,12 @@
  CDemuxStream* CDVDDemuxFFmpeg::AddStream(int streamIdx)
  {
    AVStream* pStream = m_pFormatContext->streams[streamIdx];
@@ -545,7 +543,7 @@ diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.c
    if (pStream && pStream->discard != AVDISCARD_ALL)
    {
      // Video (mp4) from GoPro cameras can have a 'meta' track used for a file repair containing
-@@ -1988,6 +2410,31 @@
+@@ -1988,7 +2408,29 @@
            st->masteringMetaData = std::make_shared<AVMasteringDisplayMetadata>(
                *reinterpret_cast<const AVMasteringDisplayMetadata*>(sideData->data));
          }
@@ -568,16 +566,14 @@ diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.c
 +          // of its track, and may be nowhere else ('dvh1'): its decoder takes that record, as it
 +          // takes the one of the enhancement layer of a one-track MP4 file. A transport stream has
 +          // them in the stream and no record.
-+          const AVCodecParameters* layer =
-+              m_pFormatContext->streams[m_dvEnhancementIndex]->codecpar;
-+          if (CDVLayerMerge::IsConfigurationRecord(layer->extradata, layer->extradata_size))
-+            st->doviELConfig = FFmpegExtraData(layer->extradata, layer->extradata_size);
+ 
 +        }
 +#endif
- 
++
          sideData = av_packet_side_data_get(pStream->codecpar->coded_side_data,
                                             pStream->codecpar->nb_coded_side_data,
-@@ -2457,6 +2904,11 @@
+                                            AV_PKT_DATA_CONTENT_LIGHT_LEVEL);
+@@ -2457,6 +2899,11 @@
      int idx = m_pFormatContext->programs[m_program]->stream_index[i];
      if (m_pFormatContext->streams[idx]->discard >= AVDISCARD_ALL)
        continue;
