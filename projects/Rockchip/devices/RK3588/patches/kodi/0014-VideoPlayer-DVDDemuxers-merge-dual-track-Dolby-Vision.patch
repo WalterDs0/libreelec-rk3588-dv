@@ -25,7 +25,7 @@ diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/CMakeLists.txt b
 +endif()
 diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
 --- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp	2026-11-10 06:45:49
-+++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp	2026-11-23 11:53:23
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp	2026-11-23 12:13:24
 @@ -58,6 +58,9 @@
  #include <libavutil/pixdesc.h>
  }
@@ -328,7 +328,7 @@ diff -ruN --exclude=*.orig a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.c
 +  const AVStream* avStream = m_pFormatContext->streams[streamIdx];
 +  CDVLayerMerge::RpuProbe probe;
 +  CDVLayerMerge::ProbeRpu(data, static_cast<size_t>(size),
-+                            CDVLayerMerge::LengthSize(avStream->codecpar), &probe);
++                            CDVLayerMerge::LengthSize(avStream->codecpar), probe);
 +  if (!probe.rpu)
 +    return;
 +  probed = PROBED_PACKETS;
