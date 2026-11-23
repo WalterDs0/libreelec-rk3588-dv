@@ -1,0 +1,95 @@
+--- baseA/xbmc/cores/AudioEngine/Sinks/AESinkALSA.cpp	2026-11-23 13:27:42.739887352 +0000
++++ b/xbmc/cores/AudioEngine/Sinks/AESinkALSA.cpp	2026-11-23 13:32:49.592507066 +0000
+@@ -19,6 +19,7 @@
+ #include "platform/Platform.h"
+ #include "utils/XTimeUtils.h"
+ #include "utils/log.h"
++#include "utils/StringUtils.h"
+ 
+ #include <algorithm>
+ #include <limits.h>
+@@ -493,6 +494,46 @@
+   else params += ",AES3=0x01";
+ }
+ 
++namespace
++{
++// RK3588: the hdmi: plugin is not usable here, so a passthrough opens hw: and the AES
++// parameters the plugin would apply are written to the card's IEC958 control.
++void SetIEC958Default(const std::string &card, const std::string &aesParams)
++{
++  unsigned int aes[4] = {0x04, 0x82, 0x00, 0x02};
++  for (const auto &kv : StringUtils::Split(aesParams, ','))
++  {
++    const auto parts = StringUtils::Split(kv, '=');
++    if (parts.size() != 2 || parts[0].size() != 4 || parts[0][0] != 'A')
++      continue;
++    const int idx = parts[0][3] - '0';
++    if (idx < 0 || idx > 3)
++      continue;
++    aes[idx] = static_cast<unsigned int>(std::strtoul(parts[1].c_str(), nullptr, 0));
++  }
++  snd_aes_iec958_t iec958 = {};
++  iec958.status[0] = static_cast<unsigned char>(aes[0]);
++  iec958.status[1] = static_cast<unsigned char>(aes[1]);
++  iec958.status[2] = static_cast<unsigned char>(aes[2]);
++  iec958.status[3] = static_cast<unsigned char>(aes[3]);
++
++  snd_ctl_t *ctl = nullptr;
++  const std::string dev = "hw:" + card;
++  if (snd_ctl_open(&ctl, dev.c_str(), 0) < 0)
++    return;
++  snd_ctl_elem_value_t *val = nullptr;
++  if (snd_ctl_elem_value_malloc(&val) == 0 && val)
++  {
++    snd_ctl_elem_value_set_interface(val, SND_CTL_ELEM_IFACE_PCM);
++    snd_ctl_elem_value_set_name(val, "IEC958 Playback Default");
++    snd_ctl_elem_value_set_iec958(val, &iec958);
++    snd_ctl_elem_write(ctl, val);
++    snd_ctl_elem_value_free(val);
++  }
++  snd_ctl_close(ctl);
++}
++}  // namespace
++
+ bool CAESinkALSA::Initialize(AEAudioFormat &format, std::string &device)
+ {
+   m_initDevice = device;
+@@ -534,6 +575,27 @@
+   if (m_passthrough || devType == AE_DEVTYPE_HDMI || devType == AE_DEVTYPE_IEC958)
+     GetAESParams(format, AESParams);
+ 
++  // RK3588: a passthrough goes through hw: (no plug/dmix, which would break the
++  // IEC61937 frames); the channel status goes to the card's IEC958 control.
++  if (m_passthrough && devType == AE_DEVTYPE_HDMI && device.substr(0, 4) != "hdmi" &&
++      device.find("CARD=hdmi") != std::string::npos)
++  {
++    const std::string card = GetParamFromName(device, "CARD");
++    if (!card.empty())
++    {
++      device = "hw:CARD=" + card + ",DEV=0";
++      SetIEC958Default(card, AESParams);
++    }
++  }
++  else if (devType == AE_DEVTYPE_HDMI && device.find("CARD=hdmi") != std::string::npos)
++  {
++    // a passthrough leaves NONAUDIO in the channel status: restore PCM's, or the sink
++    // would decode PCM as IEC61937 (silence)
++    const std::string card = GetParamFromName(device, "CARD");
++    if (!card.empty())
++      SetIEC958Default(card, "AES0=0x04,AES1=0x82,AES2=0x00,AES3=0x02");
++  }
++
+   CLog::Log(LOGINFO, "CAESinkALSA::Initialize - Attempting to open device \"{}\"", device);
+ 
+   /* get the sound config */
+@@ -1339,7 +1393,10 @@
+     return AE_DEVTYPE_HDMI;
+   else if (name.substr(0, 6) == "iec958" || name.substr(0, 5) == "spdif")
+     return AE_DEVTYPE_IEC958;
++  // RK3588: the simple-card HDMI PCMs enumerate as default/sysdefault:CARD=hdmiX
++  else if (name.find("CARD=hdmi") != std::string::npos)
++    return AE_DEVTYPE_HDMI;
+ 
+   return AE_DEVTYPE_PCM;
+ }
