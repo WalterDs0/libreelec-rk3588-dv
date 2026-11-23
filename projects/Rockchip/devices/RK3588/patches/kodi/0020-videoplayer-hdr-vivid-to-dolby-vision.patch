@@ -1,0 +1,939 @@
+diff --git a/addons/resource.language.en_gb/resources/strings.po b/addons/resource.language.en_gb/resources/strings.po
+--- a/addons/resource.language.en_gb/resources/strings.po
++++ b/addons/resource.language.en_gb/resources/strings.po
+@@ -26296,3 +26296,11 @@
+ msgctxt "#44417"
+ msgid "Preferred Chinese PGS subtitle script and layout for automatic switching."
+ msgstr ""
++
++msgctxt "#44418"
++msgid "HDR Vivid as Dolby Vision"
++msgstr ""
++
++msgctxt "#44419"
++msgid "Send HDR Vivid video as Dolby Vision Profile 8.1 using metadata converted scene-by-scene from HDR Vivid MaxRGB dynamic metadata. Takes effect on the next video."
++msgstr ""
+diff --git a/system/settings/settings.xml b/system/settings/settings.xml
+--- a/system/settings/settings.xml
++++ b/system/settings/settings.xml
+@@ -298,3 +298,15 @@
+       </group>
+       <group id="6" label="36643">
++        <setting id="videoplayer.dolbyvisionfromhdrvivid" type="boolean" label="44418" help="44419">
++          <requirement>HAVE_PIDV</requirement>
++          <dependencies>
++            <dependency type="visible">
++              <condition on="property" name="supportsdolbyvision" />
++            </dependency>
++            <dependency type="enable" setting="videoplayer.allowedhdrformats" operator="contains">0</dependency>
++          </dependencies>
++          <level>2</level>
++          <default>true</default>
++          <control type="toggle" />
++        </setting>
+         <setting id="videoplayer.dolbyvisionel" type="integer" label="36645" help="36659">
+diff --git a/xbmc/settings/Settings.h b/xbmc/settings/Settings.h
+--- a/xbmc/settings/Settings.h
++++ b/xbmc/settings/Settings.h
+@@ -159,2 +159,4 @@
+   static constexpr auto SETTING_VIDEOPLAYER_DOLBYVISIONPEAK = "videoplayer.dolbyvisionpeak";
++  static constexpr auto SETTING_VIDEOPLAYER_DOLBYVISIONFROMHDRVIVID =
++      "videoplayer.dolbyvisionfromhdrvivid";
+   static constexpr auto SETTING_VIDEOPLAYER_FILESTREAMDISPLAYORDER =
+diff --git a/xbmc/utils/HevcSei.h b/xbmc/utils/HevcSei.h
+--- a/xbmc/utils/HevcSei.h
++++ b/xbmc/utils/HevcSei.h
+@@ -48,4 +48,8 @@
+   static std::optional<const CHevcSei*> FindHdr10PlusSeiMessage(
+       const std::vector<uint8_t>& buf, const std::vector<CHevcSei>& messages);
+ 
++  // Returns an HDR Vivid SEI message if present in the list
++  static std::optional<const CHevcSei*> FindHdrVividSeiMessage(
++      const std::vector<uint8_t>& buf, const std::vector<CHevcSei>& messages);
++
+   // Returns a pair with:
+diff --git a/xbmc/utils/HevcSei.cpp b/xbmc/utils/HevcSei.cpp
+--- a/xbmc/utils/HevcSei.cpp
++++ b/xbmc/utils/HevcSei.cpp
+@@ -149,4 +149,33 @@
+   return {};
+ }
+ 
++std::optional<const CHevcSei*> CHevcSei::FindHdrVividSeiMessage(
++    const std::vector<uint8_t>& buf, const std::vector<CHevcSei>& messages)
++{
++  for (const CHevcSei& sei : messages)
++  {
++    if (sei.m_payloadType == 4 && sei.m_payloadSize >= 6)
++    {
++      CBitstreamReader br(buf.data() + sei.m_payloadOffset, sei.m_payloadSize);
++      const auto itu_t_t35_country_code = br.ReadBits(8);
++      const auto itu_t_t35_terminal_provider_code = br.ReadBits(16);
++      const auto itu_t_t35_terminal_provider_oriented_code = br.ReadBits(16);
++
++      if (itu_t_t35_country_code == 0x26 &&
++          itu_t_t35_terminal_provider_code == 0x0004 &&
++          itu_t_t35_terminal_provider_oriented_code == 0x0005)
++      {
++        if (br.AvailableBits() >= 8)
++        {
++          const auto system_start_code = br.ReadBits(8);
++          if (system_start_code >= 1 && system_start_code <= 7)
++            return &sei;
++        }
++      }
++    }
++  }
++
++  return {};
++}
++
+ std::pair<bool, const std::vector<uint8_t>> CHevcSei::RemoveHdr10PlusFromSeiNalu(
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/HDRVividDovi.h b/xbmc/cores/VideoPlayer/DVDDemuxers/HDRVividDovi.h
+new file mode 100644
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/HDRVividDovi.h
+@@ -0,0 +1,52 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++#pragma once
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#include <libavutil/dovi_meta.h>
++#include <libavutil/hdr_dynamic_vivid_metadata.h>
++#include <libavutil/mastering_display_metadata.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct hdrvivid_dovi_l1 {
++  unsigned min_pq, max_pq, avg_pq;
++  unsigned min_raw, max_raw, avg_raw;
++};
++
++bool hdrvivid_dovi_level1(const AVDynamicHDRVivid *metadata, struct hdrvivid_dovi_l1 *l1);
++bool hdrvivid_dovi_level1_from_t35(const uint8_t *t35, size_t size, struct hdrvivid_dovi_l1 *l1);
++bool hdrvivid_dovi_same_scene(const AVDynamicHDRVivid *a, const AVDynamicHDRVivid *b);
++
++struct hdrvivid_dovi_scene {
++  AVDynamicHDRVivid from;
++  bool have_from;
++  AVDOVIMetadata *first;
++  AVDOVIMetadata *made;
++  size_t size;
++};
++
++struct hdrvivid_dovi_scene *hdrvivid_dovi_scene_create(void);
++void hdrvivid_dovi_scene_reset(struct hdrvivid_dovi_scene *s);
++void hdrvivid_dovi_scene_destroy(struct hdrvivid_dovi_scene *s);
++
++const AVDOVIMetadata *hdrvivid_dovi_next(struct hdrvivid_dovi_scene *s,
++                                         const AVDynamicHDRVivid *vivid,
++                                         const uint8_t *t35, size_t t35_size,
++                                         const AVMasteringDisplayMetadata *mastering,
++                                         const AVContentLightMetadata *light,
++                                         size_t *size, bool *repeated);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/HDRVividDovi.c b/xbmc/cores/VideoPlayer/DVDDemuxers/HDRVividDovi.c
+new file mode 100644
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/HDRVividDovi.c
+@@ -0,0 +1,287 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++#include "HDRVividDovi.h"
++
++#include <math.h>
++#include <string.h>
++
++#include <libavutil/mem.h>
++#include <libavutil/rational.h>
++
++#define PQ_M1 (2610.0 / 16384.0)
++#define PQ_M2 (2523.0 / 4096.0 * 128.0)
++#define PQ_C1 (3424.0 / 4096.0)
++#define PQ_C2 (2413.0 / 4096.0 * 32.0)
++#define PQ_C3 (2392.0 / 4096.0 * 32.0)
++
++static double pq_from_linear(double y)
++{
++  y = y < 0 ? 0 : y > 1 ? 1 : y;
++  const double p = pow(y, PQ_M1);
++  return pow((PQ_C1 + PQ_C2 * p) / (1 + PQ_C3 * p), PQ_M2);
++}
++
++static unsigned code12(double e)
++{
++  const double c = floor(e * 4095 + 0.5);
++  return c < 0 ? 0 : c > 4095 ? 4095 : (unsigned)c;
++}
++
++static AVDOVIMetadata *make_profile81_metadata(unsigned min_pq, unsigned max_pq, unsigned avg_pq,
++                                               const AVMasteringDisplayMetadata *mastering,
++                                               const AVContentLightMetadata *light,
++                                               bool scene_refresh, size_t *size)
++{
++  if (!mastering || !mastering->has_luminance || !size || mastering->max_luminance.den <= 0 ||
++      mastering->min_luminance.den <= 0)
++    return NULL;
++  const double max_nits = av_q2d(mastering->max_luminance);
++  const double min_nits = av_q2d(mastering->min_luminance);
++  if (!(max_nits > 0 && max_nits <= 10000 && min_nits >= 0 && min_nits < max_nits))
++    return NULL;
++  AVDOVIMetadata *m = av_dovi_metadata_alloc(size);
++  if (!m)
++    return NULL;
++
++  AVDOVIRpuDataHeader *h = av_dovi_get_header(m);
++  h->rpu_type = 2;
++  h->rpu_format = 18;
++  h->vdr_rpu_profile = 1;
++  h->vdr_rpu_level = 0;
++  h->coef_data_type = 0;
++  h->coef_log2_denom = 23;
++  h->vdr_rpu_normalized_idc = 1;
++  h->bl_video_full_range_flag = 0;
++  h->bl_bit_depth = 10;
++  h->el_bit_depth = 10;
++  h->vdr_bit_depth = 12;
++  h->spatial_resampling_filter_flag = 0;
++  h->el_spatial_resampling_filter_flag = 0;
++  h->disable_residual_flag = 1;
++
++  AVDOVIDataMapping *map = av_dovi_get_mapping(m);
++  map->vdr_rpu_id = 0;
++  map->mapping_color_space = 0;
++  map->mapping_chroma_format_idc = 0;
++  for (int c = 0; c < 3; ++c) {
++    AVDOVIReshapingCurve *curve = &map->curves[c];
++    curve->num_pivots = 2;
++    curve->pivots[0] = 0;
++    curve->pivots[1] = 1023;
++    curve->mapping_idc[0] = AV_DOVI_MAPPING_POLYNOMIAL;
++    curve->poly_order[0] = 1;
++    curve->poly_coef[0][0] = 0;
++    curve->poly_coef[0][1] = 1 << 23;
++    curve->poly_coef[0][2] = 0;
++  }
++  map->nlq_method_idc = AV_DOVI_NLQ_NONE;
++  map->num_x_partitions = 1;
++  map->num_y_partitions = 1;
++
++  AVDOVIColorMetadata *col = av_dovi_get_color(m);
++  static const int ycc[9] = {9574, 0, 13802, 9574, -1540, -5348, 9574, 17610, 0};
++  static const int lms[9] = {7222, 8771, 390, 2654, 12430, 1300, 0, 422, 15962};
++  for (int i = 0; i < 9; ++i) {
++    col->ycc_to_rgb_matrix[i] = (AVRational){ycc[i], 8192};
++    col->rgb_to_lms_matrix[i] = (AVRational){lms[i], 16384};
++  }
++  col->ycc_to_rgb_offset[0] = (AVRational){16777216, 1 << 28};
++  col->ycc_to_rgb_offset[1] = (AVRational){134217728, 1 << 28};
++  col->ycc_to_rgb_offset[2] = (AVRational){134217728, 1 << 28};
++  col->dm_metadata_id = 0;
++  col->scene_refresh_flag = scene_refresh;
++  col->signal_eotf = 65535;
++  col->signal_bit_depth = 12;
++  col->signal_color_space = 0;
++  col->signal_chroma_format = 0;
++  col->signal_full_range_flag = 1;
++  col->source_min_pq = min_nits <= 0.001 ? 7 : code12(pq_from_linear(min_nits / 10000));
++  col->source_max_pq = code12(pq_from_linear(max_nits / 10000));
++  col->source_diagonal = 42;
++
++  m->num_ext_blocks = 0;
++  AVDOVIDmData *e = av_dovi_get_ext(m, m->num_ext_blocks++);
++  e->level = 1;
++  e->l1.min_pq = (uint16_t)min_pq;
++  e->l1.max_pq = (uint16_t)max_pq;
++  e->l1.avg_pq = (uint16_t)avg_pq;
++  e = av_dovi_get_ext(m, m->num_ext_blocks++);
++  e->level = 6;
++  e->l6.max_luminance = (uint16_t)floor(max_nits + 0.5);
++  e->l6.min_luminance = (uint16_t)floor(min_nits * 10000 + 0.5);
++  e->l6.max_cll = light ? (uint16_t)(light->MaxCLL > 65535 ? 65535 : light->MaxCLL) : 0;
++  e->l6.max_fall = light ? (uint16_t)(light->MaxFALL > 65535 ? 65535 : light->MaxFALL) : 0;
++  return m;
++}
++
++bool hdrvivid_dovi_level1(const AVDynamicHDRVivid *m, struct hdrvivid_dovi_l1 *l1)
++{
++  if (!m || !l1 || m->num_windows < 1)
++    return false;
++  if (m->system_start_code < 1 || m->system_start_code > 7)
++    return false;
++
++  memset(l1, 0, sizeof(*l1));
++  const AVHDRVividColorTransformParams *w = &m->params[0];
++
++  if (w->minimum_maxrgb.den <= 0 || w->average_maxrgb.den <= 0 || w->maximum_maxrgb.den <= 0)
++    return false;
++
++  const unsigned min_raw = (unsigned)w->minimum_maxrgb.num;
++  const unsigned avg_raw = (unsigned)w->average_maxrgb.num;
++  const unsigned max_raw = (unsigned)w->maximum_maxrgb.num;
++
++  if (min_raw > avg_raw || avg_raw > max_raw || max_raw > 4095)
++    return false;
++
++  l1->min_raw = min_raw;
++  l1->avg_raw = avg_raw;
++  l1->max_raw = max_raw;
++
++  l1->min_pq = min_raw <= 12 ? min_raw : 12;
++  l1->max_pq = max_raw < 2081 ? 2081 : max_raw;
++  l1->avg_pq = avg_raw < 819 ? 819 : avg_raw;
++  if (l1->avg_pq > l1->max_pq - 1)
++    l1->avg_pq = l1->max_pq - 1;
++  if (l1->min_pq > l1->avg_pq)
++    l1->min_pq = l1->avg_pq;
++
++  return true;
++}
++
++bool hdrvivid_dovi_level1_from_t35(const uint8_t *t35, size_t size, struct hdrvivid_dovi_l1 *l1)
++{
++  if (!t35 || size < 12 || !l1)
++    return false;
++  if (t35[0] != 0x26 || t35[1] != 0x00 || t35[2] != 0x04 || t35[3] != 0x00 || t35[4] != 0x05)
++    return false;
++  const uint8_t start_code = t35[5];
++  if (start_code < 1 || start_code > 7)
++    return false;
++
++  const unsigned min_raw = ((unsigned)t35[6] << 4) | ((unsigned)t35[7] >> 4);
++  const unsigned avg_raw = (((unsigned)t35[7] & 0x0F) << 8) | (unsigned)t35[8];
++  const unsigned max_raw = (((unsigned)t35[10] & 0x0F) << 8) | (unsigned)t35[11];
++
++  if (min_raw > avg_raw || avg_raw > max_raw || max_raw > 4095)
++    return false;
++
++  l1->min_raw = min_raw;
++  l1->avg_raw = avg_raw;
++  l1->max_raw = max_raw;
++
++  l1->min_pq = min_raw <= 12 ? min_raw : 12;
++  l1->max_pq = max_raw < 2081 ? 2081 : max_raw;
++  l1->avg_pq = avg_raw < 819 ? 819 : avg_raw;
++  if (l1->avg_pq > l1->max_pq - 1)
++    l1->avg_pq = l1->max_pq - 1;
++  if (l1->min_pq > l1->avg_pq)
++    l1->min_pq = l1->avg_pq;
++
++  return true;
++}
++
++bool hdrvivid_dovi_same_scene(const AVDynamicHDRVivid *a, const AVDynamicHDRVivid *b)
++{
++  if (!a || !b || a->system_start_code != b->system_start_code || a->num_windows != b->num_windows)
++    return false;
++  const int windows = a->num_windows < 1 ? 1 : a->num_windows > 3 ? 3 : a->num_windows;
++  for (int i = 0; i < windows; ++i) {
++    const AVHDRVividColorTransformParams *p = &a->params[i], *q = &b->params[i];
++    if (p->minimum_maxrgb.num != q->minimum_maxrgb.num ||
++        p->average_maxrgb.num != q->average_maxrgb.num ||
++        p->maximum_maxrgb.num != q->maximum_maxrgb.num ||
++        p->tone_mapping_mode_flag != q->tone_mapping_mode_flag)
++      return false;
++  }
++  return true;
++}
++
++struct hdrvivid_dovi_scene *hdrvivid_dovi_scene_create(void)
++{
++  return av_mallocz(sizeof(struct hdrvivid_dovi_scene));
++}
++
++void hdrvivid_dovi_scene_reset(struct hdrvivid_dovi_scene *s)
++{
++  if (!s)
++    return;
++  av_freep(&s->first);
++  av_freep(&s->made);
++  memset(s, 0, sizeof(*s));
++}
++
++void hdrvivid_dovi_scene_destroy(struct hdrvivid_dovi_scene *s)
++{
++  hdrvivid_dovi_scene_reset(s);
++  av_free(s);
++}
++
++const AVDOVIMetadata *hdrvivid_dovi_next(struct hdrvivid_dovi_scene *s,
++                                         const AVDynamicHDRVivid *vivid,
++                                         const uint8_t *t35, size_t t35_size,
++                                         const AVMasteringDisplayMetadata *mastering,
++                                         const AVContentLightMetadata *light,
++                                         size_t *size, bool *repeated)
++{
++  if (!s || !size || !repeated)
++    return NULL;
++  *repeated = false;
++
++  struct hdrvivid_dovi_l1 l1;
++  bool has_l1 = false;
++  if (vivid)
++    has_l1 = hdrvivid_dovi_level1(vivid, &l1);
++  else if (t35 && t35_size >= 12)
++    has_l1 = hdrvivid_dovi_level1_from_t35(t35, t35_size, &l1);
++
++  if (has_l1) {
++    if (s->made && s->have_from && vivid && hdrvivid_dovi_same_scene(&s->from, vivid)) {
++      *size = s->size;
++      return s->made;
++    }
++
++    AVMasteringDisplayMetadata default_mastering;
++    if (!mastering || !mastering->has_luminance) {
++      memset(&default_mastering, 0, sizeof(default_mastering));
++      default_mastering.has_luminance = 1;
++      default_mastering.max_luminance = (AVRational){4000, 1};
++      default_mastering.min_luminance = (AVRational){1, 10000};
++      mastering = &default_mastering;
++    }
++
++    size_t bytes = 0;
++    AVDOVIMetadata *first = make_profile81_metadata(l1.min_pq, l1.max_pq, l1.avg_pq,
++                                                    mastering, light, true, &bytes);
++    AVDOVIMetadata *made = first ? av_malloc(bytes) : NULL;
++    if (made) {
++      memcpy(made, first, bytes);
++      av_dovi_get_color(made)->scene_refresh_flag = 0;
++      av_free(s->first);
++      av_free(s->made);
++      s->first = first;
++      s->made = made;
++      s->size = bytes;
++      if (vivid) {
++        s->from = *vivid;
++        s->have_from = true;
++      } else {
++        s->have_from = false;
++      }
++      *size = bytes;
++      return s->first;
++    }
++    av_free(first);
++  }
++
++  if (!s->made)
++    return NULL;
++  *repeated = true;
++  *size = s->size;
++  return s->made;
++}
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVHdrVivid.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVHdrVivid.h
+new file mode 100644
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVHdrVivid.h
+@@ -0,0 +1,50 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++extern "C"
++{
++#include <libavcodec/codec_par.h>
++#include <libavutil/dovi_meta.h>
++#include <libavutil/rational.h>
++}
++
++class CDVHdrVivid
++{
++public:
++  struct AccessUnit
++  {
++    bool picture = false;
++    bool dolbyVision = false;
++    bool mastering = false;
++    std::vector<uint8_t> t35;
++  };
++
++  static AccessUnit Read(const uint8_t* data, size_t size, int lengthSize);
++
++  enum class Verdict
++  {
++    HDR_VIVID,
++    NOT_YET,
++    DOLBY_VISION,
++    NOT_PQ,
++  };
++
++  static Verdict Judge(const AccessUnit& unit, const AVCodecParameters* parameters);
++  static const char* Why(const AccessUnit& unit, const AVCodecParameters* parameters);
++
++  static bool Record(const AVCodecParameters* parameters,
++                     AVRational rate,
++                     AVDOVIDecoderConfigurationRecord& record);
++
++  static bool MakesLevel1(const std::vector<uint8_t>& t35);
++};
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVHdrVivid.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVHdrVivid.cpp
+new file mode 100644
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVHdrVivid.cpp
+@@ -0,0 +1,155 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "DVHdrVivid.h"
++
++#include "DVLayerMerge.h"
++#include "HDRVividDovi.h"
++#include "utils/HevcSei.h"
++
++namespace
++{
++void TakeUnit(const uint8_t* unit, size_t size, CDVHdrVivid::AccessUnit* au)
++{
++  if (size < 2 || (unit[0] & 0x80))
++    return;
++  const unsigned int type = (unit[0] >> 1) & 0x3f;
++  const unsigned int layer = ((unit[0] & 1) << 5) | (unit[1] >> 3);
++  if (type == 62 || type == 63)
++    au->dolbyVision = true;
++  else if (type < 32 && layer == 0)
++    au->picture = true;
++  else if (type == 39 && layer == 0 && size > 2)
++  {
++    std::vector<uint8_t> buf;
++    const std::vector<CHevcSei> messages = CHevcSei::ParseSeiRbspUnclearedEmulation(unit, size, buf);
++    for (const CHevcSei& sei : messages)
++      if (sei.m_payloadType == 137)
++        au->mastering = true;
++    if (au->t35.empty())
++    {
++      if (const auto vivid = CHevcSei::FindHdrVividSeiMessage(buf, messages))
++      {
++        const CHevcSei* sei = *vivid;
++        if (sei->m_payloadOffset + sei->m_payloadSize <= buf.size())
++          au->t35.assign(buf.begin() + sei->m_payloadOffset,
++                         buf.begin() + sei->m_payloadOffset + sei->m_payloadSize);
++      }
++    }
++  }
++}
++
++void ScanUnits(const uint8_t* data, size_t size, int lengthSize, CDVHdrVivid::AccessUnit* au)
++{
++  if (!data || !size || lengthSize < 0 || lengthSize > 4)
++    return;
++  if (lengthSize > 0)
++  {
++    size_t pos = 0;
++    while (pos + static_cast<size_t>(lengthSize) <= size)
++    {
++      size_t naluLen = 0;
++      for (int i = 0; i < lengthSize; ++i)
++        naluLen = (naluLen << 8) | data[pos + i];
++      pos += static_cast<size_t>(lengthSize);
++      if (naluLen == 0 || naluLen > size - pos)
++        break;
++      TakeUnit(data + pos, naluLen, au);
++      pos += naluLen;
++    }
++    return;
++  }
++
++  size_t i = 0;
++  while (i + 3 <= size)
++  {
++    if (data[i] == 0 && data[i + 1] == 0 &&
++        (data[i + 2] == 1 || (i + 3 < size && data[i + 2] == 0 && data[i + 3] == 1)))
++    {
++      const size_t scLen = (data[i + 2] == 1) ? 3 : 4;
++      const size_t start = i + scLen;
++      size_t j = start;
++      while (j + 3 <= size &&
++             !(data[j] == 0 && data[j + 1] == 0 &&
++               (data[j + 2] == 1 || (j + 3 < size && data[j + 2] == 0 && data[j + 3] == 1))))
++      {
++        ++j;
++      }
++      const size_t end = (j + 3 <= size) ? j : size;
++      if (end > start)
++        TakeUnit(data + start, end - start, au);
++      i = end;
++    }
++    else
++    {
++      ++i;
++    }
++  }
++}
++
++bool Pq(const AVCodecParameters* parameters)
++{
++  return parameters && parameters->color_trc == AVCOL_TRC_SMPTE2084 &&
++         parameters->color_primaries == AVCOL_PRI_BT2020;
++}
++} // namespace
++
++CDVHdrVivid::AccessUnit CDVHdrVivid::Read(const uint8_t* data, size_t size, int lengthSize)
++{
++  AccessUnit au;
++  ScanUnits(data, size, lengthSize, &au);
++  return au;
++}
++
++bool CDVHdrVivid::MakesLevel1(const std::vector<uint8_t>& t35)
++{
++  struct hdrvivid_dovi_l1 l1;
++  return hdrvivid_dovi_level1_from_t35(t35.data(), t35.size(), &l1);
++}
++
++CDVHdrVivid::Verdict CDVHdrVivid::Judge(const AccessUnit& unit, const AVCodecParameters* parameters)
++{
++  if (unit.dolbyVision)
++    return Verdict::DOLBY_VISION;
++  if (!Pq(parameters))
++    return Verdict::NOT_PQ;
++  if (!unit.picture || unit.t35.empty() || !MakesLevel1(unit.t35))
++    return Verdict::NOT_YET;
++  return Verdict::HDR_VIVID;
++}
++
++const char* CDVHdrVivid::Why(const AccessUnit& unit, const AVCodecParameters* parameters)
++{
++  if (unit.dolbyVision)
++    return "it has units of Dolby Vision";
++  if (!Pq(parameters))
++    return "its colour is not BT.2020 PQ";
++  if (!unit.picture)
++    return "no picture in the access unit";
++  if (unit.t35.empty())
++    return "no HDR Vivid metadata in the access unit";
++  if (!MakesLevel1(unit.t35))
++    return "its HDR Vivid metadata are invalid or unreadable";
++  return "";
++}
++
++bool CDVHdrVivid::Record(const AVCodecParameters* parameters,
++                         AVRational rate,
++                         AVDOVIDecoderConfigurationRecord& record)
++{
++  if (!Pq(parameters))
++    return false;
++  CDVLayerMerge::RpuProbe probe{};
++  probe.rpu = true;
++  probe.rpu_profile = 1;
++  probe.vdr_bit_depth = 12;
++  probe.residual_disabled = true;
++  probe.profile = 8;
++  return CDVLayerMerge::RecordFromRpu(probe, parameters, rate, record) && record.dv_profile == 8 &&
++         record.dv_bl_signal_compatibility_id == 1;
++}
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/CMakeLists.txt b/xbmc/cores/VideoPlayer/DVDDemuxers/CMakeLists.txt
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/CMakeLists.txt
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/CMakeLists.txt
+@@ -36,4 +36,6 @@
+ if(TARGET ${APP_NAME_LC}::PiDV)
+   list(APPEND SOURCES DVLayerMerge.cpp)
+   list(APPEND HEADERS DVLayerMerge.h)
++  list(APPEND SOURCES DVHdrVivid.cpp HDRVividDovi.c)
++  list(APPEND HEADERS DVHdrVivid.h HDRVividDovi.h)
+ endif()
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemux.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemux.h
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemux.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemux.h
+@@ -179,4 +179,5 @@
+   std::string stereo_mode; // expected stereo mode
+   StreamHdrType hdr_type = StreamHdrType::HDR_TYPE_NONE; // type of HDR for this stream (hdr10, etc)
+   AVDOVIDecoderConfigurationRecord dovi{};
++  bool doviFromHdrVivid{false};
+ };
+diff --git a/xbmc/cores/VideoPlayer/DVDStreamInfo.h b/xbmc/cores/VideoPlayer/DVDStreamInfo.h
+--- a/xbmc/cores/VideoPlayer/DVDStreamInfo.h
++++ b/xbmc/cores/VideoPlayer/DVDStreamInfo.h
+@@ -81,2 +81,3 @@
+   std::string stereo_mode; // stereoscopic 3d mode
+   AVDOVIDecoderConfigurationRecord dovi{};
++  bool doviFromHdrVivid{false};
+diff --git a/xbmc/cores/VideoPlayer/DVDStreamInfo.cpp b/xbmc/cores/VideoPlayer/DVDStreamInfo.cpp
+--- a/xbmc/cores/VideoPlayer/DVDStreamInfo.cpp
++++ b/xbmc/cores/VideoPlayer/DVDStreamInfo.cpp
+@@ -70,2 +70,3 @@
+   stereo_mode.clear();
+   dovi = {};
++  doviFromHdrVivid = false;
+@@ -156,2 +156,4 @@
+   if (0 != std::memcmp(&dovi, &right.dovi, sizeof(AVDOVIDecoderConfigurationRecord)))
+     return false;
++  if (doviFromHdrVivid != right.doviFromHdrVivid)
++    return false;
+@@ -238,2 +238,3 @@
+   stereo_mode = right.stereo_mode;
+   dovi = right.dovi;
++  doviFromHdrVivid = right.doviFromHdrVivid;
+@@ -306,2 +306,3 @@
+     stereo_mode = stream->stereo_mode;
+     dovi = stream->dovi;
++    doviFromHdrVivid = stream->doviFromHdrVivid;
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+@@ -210,3 +210,10 @@
+   std::map<int, unsigned int> m_dvProbed;
+   std::map<int, AVDOVIDecoderConfigurationRecord> m_dvPromoted;
++  std::map<int, bool> m_dvFromHdrVivid;
+   void ProbeDolbyVision(CDemuxStream* stream, int streamIdx, const uint8_t* data, int size);
++  bool ProbeHdrVivid(CDemuxStream* stream,
++                     int streamIdx,
++                     const uint8_t* data,
++                     int size,
++                     unsigned int& probed,
++                     unsigned int done);
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+@@ -61,2 +61,3 @@
+ #ifdef HAVE_PIDV
++#include "DVHdrVivid.h"
+ #endif
+@@ -737,3 +737,4 @@
+   m_dvProbed.clear();
+   m_dvPromoted.clear();
++  m_dvFromHdrVivid.clear();
+   m_dvNotJoined.clear();
+@@ -1353,4 +1353,7 @@
+                             CDVLayerMerge::LengthSize(avStream->codecpar), probe);
+   if (!probe.rpu)
++  {
++    ProbeHdrVivid(stream, streamIdx, data, size, probed, PROBED_PACKETS);
+     return;
++  }
+   probed = PROBED_PACKETS;
+@@ -1376,4 +1376,52 @@
+   PromoteDolbyVision(stream, record, nullptr);
+ }
+ 
++bool CDVDDemuxFFmpeg::ProbeHdrVivid(CDemuxStream* stream,
++                                    int streamIdx,
++                                    const uint8_t* data,
++                                    int size,
++                                    unsigned int& probed,
++                                    unsigned int done)
++{
++  if (m_dvFromHdrVivid.count(streamIdx))
++    return true;
++  const auto settings = CServiceBroker::GetSettingsComponent()->GetSettings();
++  if (!settings || !settings->GetBool(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONFROMHDRVIVID))
++    return false;
++  const AVStream* avStream = m_pFormatContext->streams[streamIdx];
++  const CDVHdrVivid::AccessUnit unit =
++      CDVHdrVivid::Read(data, static_cast<size_t>(size), CDVLayerMerge::LengthSize(avStream->codecpar));
++  if (unit.t35.empty())
++    return false;
++
++  const CDVHdrVivid::Verdict verdict = CDVHdrVivid::Judge(unit, avStream->codecpar);
++  if (verdict != CDVHdrVivid::Verdict::HDR_VIVID)
++  {
++    if (verdict != CDVHdrVivid::Verdict::NOT_YET || probed >= done)
++    {
++      probed = done;
++      CLog::Log(LOGDEBUG, "CDVDDemuxFFmpeg: stream {} has HDR Vivid metadata; not as Dolby Vision: {}",
++                streamIdx, CDVHdrVivid::Why(unit, avStream->codecpar));
++    }
++    return true;
++  }
++  probed = done;
++
++  AVDOVIDecoderConfigurationRecord record{};
++  const AVRational rate =
++      av_guess_frame_rate(m_pFormatContext, const_cast<AVStream*>(avStream), nullptr);
++  if (!CDVHdrVivid::Record(avStream->codecpar, rate, record))
++    return true;
++
++  CLog::Log(LOGINFO,
++            "CDVDDemuxFFmpeg: stream {} is HDR Vivid without Dolby Vision: promoting to Dolby Vision profile 8.1",
++            streamIdx);
++  auto* video = static_cast<CDemuxStreamVideo*>(stream);
++  m_dvPromoted[streamIdx] = record;
++  m_dvFromHdrVivid[streamIdx] = true;
++  video->doviFromHdrVivid = true;
++  PromoteDolbyVision(stream, record, nullptr);
++  return true;
++}
++
+ void CDVDDemuxFFmpeg::ReportDVLayers()
+@@ -2414,4 +2414,5 @@
+         {
+           st->hdr_type = StreamHdrType::HDR_TYPE_DOLBYVISION;
+           st->dovi = promoted->second;
++          st->doviFromHdrVivid = m_dvFromHdrVivid.count(streamIdx) != 0;
+         }
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
+@@ -13,2 +13,6 @@
+ #include <atomic>
++#include <cstdint>
++#include <deque>
+ #include <memory>
++#include <utility>
++#include <vector>
+@@ -22,2 +22,3 @@
+ class CDVELDecoderDRMPRIME;
++struct hdrvivid_dovi_scene;
+ class CVideoBufferPoolDMA;
+@@ -72,3 +72,7 @@
+ #if defined(HAVE_PIDV)
+   std::unique_ptr<CDVELDecoderDRMPRIME> m_dolbyVisionEL;
++  bool m_dvFromHdrVivid{false};
++  int m_dvLengthSize{0};
++  struct hdrvivid_dovi_scene* m_dvHdrVividScene{nullptr};
++  std::deque<std::pair<int64_t, std::vector<uint8_t>>> m_hdrVividT35Queue;
+ #endif
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+@@ -29,14 +29,18 @@
+ #if defined(HAVE_PIDV)
+ #include "DVELDecoderDRMPRIME.h"
++#include "cores/VideoPlayer/DVDDemuxers/DVHdrVivid.h"
++#include "cores/VideoPlayer/DVDDemuxers/HDRVividDovi.h"
+ #endif
+ 
+ extern "C"
+ {
+ #include <libavcodec/avcodec.h>
+ #include <libavfilter/buffersink.h>
+ #include <libavfilter/buffersrc.h>
+ #include <libavutil/error.h>
++#include <libavutil/hdr_dynamic_vivid_metadata.h>
+ #include <libavutil/imgutils.h>
+ #include <libavutil/opt.h>
+ #include <libavutil/pixdesc.h>
+ }
++#include <cstring>
+@@ -109,3 +109,6 @@
+ #if defined(HAVE_PIDV)
+   m_dolbyVisionEL.reset();
++  hdrvivid_dovi_scene_destroy(m_dvHdrVividScene);
++  m_dvHdrVividScene = nullptr;
++  m_hdrVividT35Queue.clear();
+ #endif
+@@ -405,3 +405,16 @@
+ #if defined(HAVE_PIDV)
+   m_dolbyVisionEL = CDVELDecoderDRMPRIME::Create(hints, m_pCodecContext);
++  m_dvFromHdrVivid = hints.doviFromHdrVivid && !m_dolbyVisionEL;
++  m_hdrVividT35Queue.clear();
++  hdrvivid_dovi_scene_destroy(m_dvHdrVividScene);
++  m_dvHdrVividScene = nullptr;
++  m_dvLengthSize = 0;
++  if (m_dvFromHdrVivid)
++  {
++    if (m_pCodecContext->extradata && m_pCodecContext->extradata_size >= 22 &&
++        m_pCodecContext->extradata[0] == 1)
++      m_dvLengthSize = (m_pCodecContext->extradata[21] & 3) + 1;
++    m_dvHdrVividScene = hdrvivid_dovi_scene_create();
++    CLog::Log(LOGINFO, "CDVDVideoCodecDRMPRIME: converting HDR Vivid metadata to Dolby Vision profile 8.1");
++  }
+ #endif
+@@ -457,4 +457,17 @@
+   avpkt->side_data = static_cast<AVPacketSideData*>(packet.pSideData);
+   avpkt->side_data_elems = packet.iSideDataElems;
+ 
++#if defined(HAVE_PIDV)
++  if (m_dvFromHdrVivid && packet.pData && packet.iSize > 0)
++  {
++    CDVHdrVivid::AccessUnit au = CDVHdrVivid::Read(packet.pData, static_cast<size_t>(packet.iSize), m_dvLengthSize);
++    if (!au.t35.empty())
++    {
++      m_hdrVividT35Queue.emplace_back(avpkt->pts, std::move(au.t35));
++      if (m_hdrVividT35Queue.size() > 64)
++        m_hdrVividT35Queue.pop_front();
++    }
++  }
++#endif
++
+   int ret;
+@@ -517,4 +517,6 @@
+ #if defined(HAVE_PIDV)
+   if (m_dolbyVisionEL)
+     m_dolbyVisionEL->Flush();
++  hdrvivid_dovi_scene_reset(m_dvHdrVividScene);
++  m_hdrVividT35Queue.clear();
+ #endif
+@@ -693,3 +693,51 @@
+   if (IsSupportedHwFormat(static_cast<AVPixelFormat>(m_pFrame->format)))
+   {
++#if defined(HAVE_PIDV)
++    if (m_dvFromHdrVivid && m_dvHdrVividScene)
++    {
++      const AVFrameSideData* sdVivid =
++          av_frame_get_side_data(m_pFrame, AV_FRAME_DATA_DYNAMIC_HDR_VIVID);
++      const auto* vivid =
++          (sdVivid && sdVivid->size >= sizeof(AVDynamicHDRVivid))
++              ? reinterpret_cast<const AVDynamicHDRVivid*>(sdVivid->data)
++              : nullptr;
++      std::vector<uint8_t> t35;
++      if (!vivid && !m_hdrVividT35Queue.empty())
++      {
++        const int64_t framePts = m_pFrame->best_effort_timestamp;
++        for (auto it = m_hdrVividT35Queue.begin(); it != m_hdrVividT35Queue.end(); ++it)
++        {
++          if (it->first == framePts)
++          {
++            t35 = std::move(it->second);
++            m_hdrVividT35Queue.erase(m_hdrVividT35Queue.begin(), std::next(it));
++            break;
++          }
++        }
++      }
++      const AVFrameSideData* sdMaster =
++          av_frame_get_side_data(m_pFrame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
++      const auto* mastering =
++          (sdMaster && sdMaster->size >= sizeof(AVMasteringDisplayMetadata))
++              ? reinterpret_cast<const AVMasteringDisplayMetadata*>(sdMaster->data)
++              : m_hints.masteringMetadata.get();
++      const AVFrameSideData* sdLight =
++          av_frame_get_side_data(m_pFrame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
++      const auto* light =
++          (sdLight && sdLight->size >= sizeof(AVContentLightMetadata))
++              ? reinterpret_cast<const AVContentLightMetadata*>(sdLight->data)
++              : m_hints.contentLightMetadata.get();
++      size_t madeSize = 0;
++      bool repeated = false;
++      const AVDOVIMetadata* made = hdrvivid_dovi_next(
++          m_dvHdrVividScene, vivid, t35.empty() ? nullptr : t35.data(), t35.size(),
++          mastering, light, &madeSize, &repeated);
++      if (made && madeSize > 0)
++      {
++        av_frame_remove_side_data(m_pFrame, AV_FRAME_DATA_DOVI_METADATA);
++        if (AVFrameSideData* doviSd = av_frame_new_side_data(m_pFrame, AV_FRAME_DATA_DOVI_METADATA, madeSize))
++          std::memcpy(doviSd->data, made, madeSize);
++      }
++    }
++#endif
+     CVideoBufferDRMPRIMEFFmpeg* buffer = m_hwVideoBufferPool->Get();
