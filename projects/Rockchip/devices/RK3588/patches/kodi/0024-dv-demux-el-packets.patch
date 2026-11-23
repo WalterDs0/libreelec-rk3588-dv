@@ -1,0 +1,348 @@
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.h
+@@ -291,6 +291,18 @@
+    */
+   bool Pop(AVPacket* packet, bool end);
+ 
++  /*!
++   * \brief The enhancement-layer access unit of the packet that Pop() (or Read()) gave last
++   *
++   * Hades: the two layers are decoded by decoders of their own and paired by presentation time,
++   * so the enhancement layer does not go into the base layer's bitstream: the access unit keeps
++   * its own framing, and its RPU stays the unit of type 62 that the decoder of the enhancement
++   * layer reads (a unit of the one-track form would not be, and is refused). The merge owns the
++   * packet until the next one: Kodi's demuxer copies it into the DemuxPacket of the base packet.
++   * \return nullptr when the last packet went out alone, or was not a base-layer packet
++   */
++  const AVPacket* GetLayer() const { return m_layer.data && m_layer.size > 0 ? &m_layer : nullptr; }
++
+   //! \brief Forget what waits (a seek, a flush)
+   void Clear();
+ 
+@@ -479,6 +491,9 @@
+   int64_t ToBase(int64_t time) const;
+   void AttachLayerTime(AVPacket* base, int64_t enhancementPts) const;
+   static bool SetLayerTime(AVPacket* packet, const char* value);
++  //! whether these bytes are a sequence of units an enhancement layer can be decoded from: no
++  //! unit of type 63, which would make the track the one-track form itself
++  static bool IsLayer(const AVPacket& enhancement, int enhancementLengthSize);
+   static void Forget(Track& track);
+   static bool SameUnit(const Waiting& a, const Waiting& b);
+   static bool After(const Waiting& enhancement, const Waiting& base);
+@@ -492,6 +507,8 @@
+ 
+   Track m_base;
+   Track m_enhancement;
++  //! the enhancement access unit of the last base packet that went out with one (GetLayer())
++  AVPacket m_layer{};
+   AVRational m_timeBase{0, 1}; //!< of the base track; not known: no LAYER_TIME
+   AVRational m_enhancementTimeBase{0, 1};
+   unsigned int m_silentAfter = SILENT;
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.cpp
+@@ -732,6 +732,7 @@
+ {
+   Forget(m_base);
+   Forget(m_enhancement);
++  av_packet_unref(&m_layer);
+ }
+ 
+ void CDVLayerMerge::Forget(Track& track)
+@@ -871,6 +872,7 @@
+ {
+   Forget(m_base);
+   Forget(m_enhancement);
++  av_packet_unref(&m_layer);
+   // a stream that never had a packet of the layer is not waited for again after every seek
+   m_silent = m_absent ? m_silentAfter : 0;
+   m_end = false;
+@@ -1089,6 +1091,21 @@
+   return true;
+ }
+ 
++bool CDVLayerMerge::IsLayer(const AVPacket& enhancement, int enhancementLengthSize)
++{
++  if (!enhancement.data || enhancement.size <= 0 || enhancementLengthSize < 0 ||
++      enhancementLengthSize > 4)
++    return false;
++
++  bool wrapped = false;
++  const bool units =
++      ForEachUnit(enhancement.data, static_cast<size_t>(enhancement.size), enhancementLengthSize,
++                  [&wrapped](const uint8_t* unit, size_t length)
++                  { wrapped |= ((unit[0] >> 1) & 0x3f) == NAL_WRAPPED; });
++  // (a unit of type 63 says the track is the one-track form itself: no enhancement layer has one)
++  return units && !wrapped;
++}
++
+ void CDVLayerMerge::SetTimeBases(AVRational base, AVRational enhancement)
+ {
+   m_timeBase = base;
+@@ -1429,6 +1446,10 @@
+ 
+ bool CDVLayerMerge::Pop(AVPacket* packet, bool end)
+ {
++  // (Hades: the enhancement layer of the packet that goes out now is the one GetLayer() gives;
++  // the one of the packet before it is taken by then)
++  av_packet_unref(&m_layer);
++
+   if (m_verification == Verification::PENDING &&
+       (end || m_silent >= m_silentAfter || m_base.waiting.size() >= MAX_WAITING))
+   {
+@@ -1499,11 +1520,15 @@
+     AVPacket* enhancement = match->packet;
+     m_enhancement.waiting.erase(m_enhancement.waiting.begin(), match + 1);
+ 
+-    if (Append(base.packet, enhancement->data, static_cast<size_t>(std::max(enhancement->size, 0)),
+-               m_base.lengthSize, m_enhancement.lengthSize))
++    // (Hades) the enhancement access unit goes out on its own: the base layer's bitstream is
++    // never modified, its framing stays what the container made it, and the units keep their
++    // types (the RPU the unit of type 62 the decoder of the enhancement layer reads)
++    const int64_t enhancementPts = enhancement->pts;
++    if (IsLayer(*enhancement, m_enhancement.lengthSize))
+     {
++      av_packet_move_ref(&m_layer, enhancement);
+       m_counts.joined++;
+-      AttachLayerTime(base.packet, enhancement->pts);
++      AttachLayerTime(base.packet, enhancementPts);
+     }
+     else
+     {
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemux.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemux.h
+@@ -180,6 +180,14 @@
+   StreamHdrType hdr_type = StreamHdrType::HDR_TYPE_NONE; // type of HDR for this stream (hdr10, etc)
+   AVDOVIDecoderConfigurationRecord dovi{};
+   bool doviFromHdrVivid{false};
++  //! Dolby Vision profile 7 in two video tracks: the enhancement layer is a track of its own,
++  //! which the player decodes with a decoder of its own and pairs with this layer by
++  //! presentation time (Hades).
++  bool doviEL{false};
++  //! its codec configuration, for that decoder: an hvcC record in MP4 and Matroska (the record
++  //! may hold the parameter sets, which are then nowhere else); a transport stream has them in
++  //! the stream and no record
++  FFmpegExtraData doviELExtradata;
+ };
+ 
+ class CDemuxStreamAudio : public CDemuxStream
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+@@ -1176,9 +1176,10 @@
+   else if (layers.described)
+     how = "Dolby Vision descriptor";
+   CLog::Log(LOGINFO,
+-            "CDVDDemuxFFmpeg: Dolby Vision profile 7 in two video tracks ({}): the enhancement "
+-            "layer and the RPU of stream {} are joined to the base layer of stream {}",
+-            how, enhancement, base);
++            "CDVDDemuxFFmpeg: Dolby Vision profile 7 in two video tracks ({}): the base layer of "
++            "stream {} and the enhancement layer of stream {} are decoded by decoders of their "
++            "own and paired by presentation time; the base layer's bitstream is not modified",
++            how, base, enhancement);
+ }
+ 
+ // After the streams are made: the enhancement layer is no stream of the player, but its packets
+@@ -1243,7 +1244,16 @@
+     return;
+   video->hdr_type = StreamHdrType::HDR_TYPE_DOLBYVISION;
+   video->dovi = record;
+-  (void)enhancement;
++  // (Hades: the enhancement layer is a track of its own, and its decoder opens with the codec
++  // configuration of that track: an unverified pair becomes Dolby Vision only when its packets
++  // show it, which is after the streams are made)
++  if (enhancement)
++  {
++    video->doviEL = true;
++    if (enhancement->extradata && enhancement->extradata_size > 0)
++      video->doviELExtradata =
++          FFmpegExtraData(enhancement->extradata, enhancement->extradata_size);
++  }
+   // VideoPlayer opens the codec of the stream again with what it is now (CheckStreamChanges())
+   video->changes++;
+ }
+@@ -1447,14 +1457,15 @@
+         counts.offset * av_q2d(m_pFormatContext->streams[m_dvBaseIndex]->time_base) * 1000,
+         counts.offsets, counts.unconfirmed);
+   CLog::Log(LOGINFO,
+-            "CDVDDemuxFFmpeg: Dolby Vision in two tracks so far: {} access units joined and {} "
+-            "without their enhancement layer; {} enhancement packets had no base packet ({} of "
+-            "them before the first access unit joined after the start or a seek) and {} were not "
+-            "unit streams; at most {} base and {} enhancement packets waited for the other layer; "
+-            "the time of {} enhancement access units could not be used (they are presented "
+-            "before the start time of the file){}",
+-            counts.joined, counts.alone, counts.dropped, counts.droppedFirst, counts.malformed,
+-            counts.waited, counts.queued, counts.unusable, offset);
++            "CDVDDemuxFFmpeg: Dolby Vision in two tracks so far: {} base-layer packets with the "
++            "access unit of their enhancement layer and {} without one ({} access units attached "
++            "to the demux packets); {} enhancement packets had no base packet ({} of them before "
++            "the first access unit paired after the start or a seek) and {} were not unit "
++            "streams; at most {} base and {} enhancement packets waited for the other layer; the "
++            "time of {} enhancement access units could not be used (they are presented before the "
++            "start time of the file){}",
++            counts.joined, counts.alone, m_dvELAttached, counts.dropped, counts.droppedFirst,
++            counts.malformed, counts.waited, counts.queued, counts.unusable, offset);
+ }
+ 
+ void CDVDDemuxFFmpeg::TellDVOffset()
+@@ -1630,6 +1641,33 @@
+                                               stream->time_base.den);
+ 
+ #ifdef HAVE_PIDV
++          // Dolby Vision profile 7 in two tracks: the enhancement layer's access unit of this
++          // base packet, which the player decodes with a decoder of its own (Hades). A copy: the
++          // packet owns it until CDVDDemuxUtils::FreeDemuxPacket(). Its time is made the way the
++          // time of the base packet was, so that the two pictures pair by presentation time.
++          if (m_pkt.pkt.stream_index == m_dvBaseIndex && m_dvEnhancementIndex >= 0)
++          {
++            if (const AVPacket* layer = m_dvMerge.GetLayer())
++            {
++              pPacket->elData = new uint8_t[layer->size];
++              memcpy(pPacket->elData, layer->data, layer->size);
++              pPacket->elSize = layer->size;
++              if (layer->pts == (int64_t)AV_NOPTS_VALUE)
++                pPacket->elPts = (int64_t)AV_NOPTS_VALUE;
++              else
++              {
++                const AVStream* el = m_pFormatContext->streams[m_dvEnhancementIndex];
++                pPacket->elPts = (int64_t)ConvertTimestamp(layer->pts, el->time_base.den,
++                                                           el->time_base.num);
++              }
++              if (++m_dvELAttached == 1)
++                CLog::Log(LOGINFO,
++                          "CDVDDemuxFFmpeg: Dolby Vision in two tracks: the first enhancement "
++                          "access unit ({} bytes) is attached to its base packet",
++                          layer->size);
++            }
++          }
++
+           // A packet of two joined tracks says when its enhancement access unit is presented by
+           // the difference to its own time, which is the difference between the two times made
+           // here only where ConvertTimestamp() moves both alike: not across the start time,
+@@ -2481,7 +2519,16 @@
+           // of its track, and may be nowhere else ('dvh1'): its decoder takes that record, as it
+           // takes the one of the enhancement layer of a one-track MP4 file. A transport stream has
+           // them in the stream and no record.
+-
++          if (m_dvEnhancementIndex >= 0 &&
++              static_cast<unsigned int>(m_dvEnhancementIndex) < m_pFormatContext->nb_streams)
++          {
++            const AVCodecParameters* enhancement =
++                m_pFormatContext->streams[m_dvEnhancementIndex]->codecpar;
++            st->doviEL = true;
++            if (enhancement->extradata && enhancement->extradata_size > 0)
++              st->doviELExtradata =
++                  FFmpegExtraData(enhancement->extradata, enhancement->extradata_size);
++          }
+         }
+ #endif
+ 
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+@@ -188,6 +188,8 @@
+   int m_dvEnhancementIndex = -1;
+   AVDOVIDecoderConfigurationRecord m_dvRecord{}; //!< of the stream that the two tracks become
+   uint64_t m_dvReported = 0; //!< access units counted in the last line of the log
++  //! demux packets that carried the enhancement layer's access unit (DemuxPacket::elData)
++  uint64_t m_dvELAttached = 0;
+   CDVLayerMerge m_dvMerge;
+   //! the packet that was read last had the time of its enhancement access unit checked
+   bool m_dvLayerChecked{false};
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxUtils.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxUtils.cpp
+@@ -25,15 +25,14 @@
+ 
+ void CDVDDemuxUtils::FreeDemuxPacket(DemuxPacket* pPacket)
+ {
+-  if (pPacket->elData)
+-  {
+-    delete[] pPacket->elData;
+-    pPacket->elData = nullptr;
+-    pPacket->elSize = 0;
+-  }
+-
+   if (pPacket)
+   {
++    if (pPacket->elData)
++    {
++      delete[] pPacket->elData;
++      pPacket->elData = nullptr;
++      pPacket->elSize = 0;
++    }
+     if (pPacket->pData)
+       KODI::MEMORY::AlignedFree(pPacket->pData);
+     if (pPacket->iSideDataElems)
+--- a/xbmc/cores/VideoPlayer/DVDStreamInfo.h
++++ b/xbmc/cores/VideoPlayer/DVDStreamInfo.h
+@@ -81,6 +81,12 @@
+   std::string stereo_mode; // stereoscopic 3d mode
+   AVDOVIDecoderConfigurationRecord dovi{};
+   bool doviFromHdrVivid{false};
++  //! Dolby Vision profile 7 in two video tracks: the enhancement layer is a track of its own,
++  //! which the player decodes with a decoder of its own (Hades)
++  bool doviEL{false};
++  //! its codec configuration, for that decoder (an hvcC record in MP4 and Matroska; a transport
++  //! stream has the parameter sets in the stream and no record)
++  FFmpegExtraData doviELExtradata;
+ 
+   // Dolby Vision profile 8 compatibility IDs 1 and 4 identify HDR10 and HLG
+   // base layers respectively.
+--- a/xbmc/cores/VideoPlayer/DVDStreamInfo.cpp
++++ b/xbmc/cores/VideoPlayer/DVDStreamInfo.cpp
+@@ -70,6 +70,8 @@
+   stereo_mode.clear();
+   dovi = {};
+   doviFromHdrVivid = false;
++  doviEL = false;
++  doviELExtradata = {};
+ 
+   channels   = 0;
+   samplerate = 0;
+@@ -90,7 +92,8 @@
+       flags != right.flags)
+     return false;
+ 
+-  if (compare & COMPARE_EXTRADATA && extradata != right.extradata)
++  if (compare & COMPARE_EXTRADATA &&
++      (extradata != right.extradata || doviELExtradata != right.doviELExtradata))
+   {
+     return false;
+   }
+@@ -115,6 +118,7 @@
+   || colorRange != right.colorRange
+   || colorPrimaries != right.colorPrimaries
+   || colorTransferCharacteristic != right.colorTransferCharacteristic
++  || doviEL != right.doviEL
+   || stereo_mode != right.stereo_mode)
+     return false;
+   // clang-format on
+@@ -156,9 +160,9 @@
+     return false;
+ 
+   if (0 != std::memcmp(&dovi, &right.dovi, sizeof(AVDOVIDecoderConfigurationRecord)))
++    return false;
+   if (doviFromHdrVivid != right.doviFromHdrVivid)
+     return false;
+-    return false;
+ 
+   // AUDIO
+   if( channels      != right.channels
+@@ -241,6 +245,11 @@
+   stereo_mode = right.stereo_mode;
+   dovi = right.dovi;
+   doviFromHdrVivid = right.doviFromHdrVivid;
++  doviEL = right.doviEL;
++  if (withextradata)
++    doviELExtradata = right.doviELExtradata;
++  else
++    doviELExtradata = {};
+ 
+   // AUDIO
+   channels      = right.channels;
+@@ -310,6 +319,8 @@
+     stereo_mode = stream->stereo_mode;
+     dovi = stream->dovi;
+     doviFromHdrVivid = stream->doviFromHdrVivid;
++    doviEL = stream->doviEL;
++    doviELExtradata = stream->doviELExtradata;
+   }
+   else if (right.type == StreamType::SUBTITLE)
+   {
