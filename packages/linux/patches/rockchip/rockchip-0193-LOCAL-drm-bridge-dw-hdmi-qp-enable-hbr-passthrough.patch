@@ -1,0 +1,28 @@
+From: momokind <momokind2002@gmail.com>
+Subject: [PATCH] drm/bridge: dw-hdmi-qp: enable HBR passthrough over I2S
+
+RK3588 HDMI audio uses rockchip_i2s_tdm which transfers packed IEC61937
+frames over standard I2S PCM formats (S16_LE/S24_LE/S32_LE) rather than
+SNDRV_PCM_FORMAT_IEC958_SUBFRAME_LE, with IEC958_AES0_NONAUDIO set in
+the HDMI codec IEC958 channel status via ALSA AES0.
+
+Enable AUD_HBR in dw_hdmi_qp_set_audio_interface() when 8-channel
+NONAUDIO is active even when fmt->bit_fmt is not IEC958_SUBFRAME_LE,
+so TrueHD and DTS-HD MA passthrough use HBR mode and 768 kHz channel
+status.
+
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.c
+@@ -396,7 +396,11 @@ static void dw_hdmi_qp_set_audio_interface(struct dw_hdmi_qp *hdmi,
+ 		conf0 |= I2S_BPCUV_RCV_EN;
+ 		break;
+ 	default:
+-		conf0 = AUD_ASP | I2S_BPCUV_RCV_DIS;
++		conf0 = (hparms->channels == 8 &&
++			 (hparms->iec.status[0] & IEC958_AES0_NONAUDIO))
++			? AUD_HBR
++			: AUD_ASP;
++		conf0 |= I2S_BPCUV_RCV_DIS;
+ 		break;
+ 	}
+ 
