@@ -1,0 +1,50 @@
+--- a/xbmc/cores/VideoPlayer/Interface/DemuxPacket.h
++++ b/xbmc/cores/VideoPlayer/Interface/DemuxPacket.h
+@@ -49,7 +49,9 @@
+     //!        (the base layer's bitstream is never modified)
+     uint8_t* elData{nullptr};
+     int elSize{0};
+-    int64_t elPts{0};
++    //! its presentation time, in DVD_TIME_BASE units like pts (double, so that the two layers'
++    //! times of a picture convert to the same value the same way)
++    double elPts{DVD_NOPTS_VALUE};
+   };
+ 
+ #ifdef __cplusplus
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+@@ -1652,14 +1652,8 @@
+               pPacket->elData = new uint8_t[layer->size];
+               memcpy(pPacket->elData, layer->data, layer->size);
+               pPacket->elSize = layer->size;
+-              if (layer->pts == (int64_t)AV_NOPTS_VALUE)
+-                pPacket->elPts = (int64_t)AV_NOPTS_VALUE;
+-              else
+-              {
+-                const AVStream* el = m_pFormatContext->streams[m_dvEnhancementIndex];
+-                pPacket->elPts = (int64_t)ConvertTimestamp(layer->pts, el->time_base.den,
+-                                                           el->time_base.num);
+-              }
++              const AVStream* el = m_pFormatContext->streams[m_dvEnhancementIndex];
++              pPacket->elPts = ConvertTimestamp(layer->pts, el->time_base.den, el->time_base.num);
+               if (++m_dvELAttached == 1)
+                 CLog::Log(LOGINFO,
+                           "CDVDDemuxFFmpeg: Dolby Vision in two tracks: the first enhancement "
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+@@ -506,11 +506,12 @@
+     ret = avcodec_send_packet(m_pCodecContext, avpkt);
+     if (ret == 0 && packet.elData && packet.elSize > 0)
+     {
++      // the same expression as the base packet's pts above: a picture's two layers must get
++      // the same value, or the pairer (which pairs by equal presentation time) drops them
+       const int64_t elPts =
+-          packet.elPts == static_cast<int64_t>(AV_NOPTS_VALUE)
++          packet.elPts == DVD_NOPTS_VALUE
+               ? static_cast<int64_t>(AV_NOPTS_VALUE)
+-              : static_cast<int64_t>(static_cast<double>(packet.elPts) / DVD_TIME_BASE *
+-                                     AV_TIME_BASE);
++              : static_cast<int64_t>(packet.elPts / DVD_TIME_BASE * AV_TIME_BASE);
+       m_dolbyVisionEL->SendLayer(packet.elData, packet.elSize, elPts);
+     }
+   }

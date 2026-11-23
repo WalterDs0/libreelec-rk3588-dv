@@ -1,0 +1,32 @@
+--- a/engine/pi_input.c
++++ b/engine/pi_input.c
+@@ -68,6 +68,8 @@
+ }
+ 
+ #define PAIR_QUEUE 32   /* pictures held per layer */
++/* the two layers of a picture may land a rounding apart, in us */
++#define PAIR_TOLERANCE_US 2000
+ 
+ struct pi_pairer {
+     int layers, el_seen, depth;
+@@ -180,14 +182,18 @@
+         if (two && p->el_timed) {
+             int64_t a = p->q[0][0]->pts, t = p->q[1][0]->pts;
+             int timed = a != AV_NOPTS_VALUE && t != AV_NOPTS_VALUE;
+-            if (timed && t < a) {   /* an EL picture whose BL was lost */
++            /* The two tracks of a stream may convert the same time of a picture to values that
++             * differ by rounding (the framing of their packets, their time bases), so a pair is
++             * a pair when the times are the same but for a little; beyond that one is ahead. */
++            int64_t diff = timed ? (a > t ? a - t : t - a) : 0;
++            if (timed && diff > PAIR_TOLERANCE_US && t < a) {   /* an EL picture whose BL was lost */
+                 e = take(p, 1);
+                 av_frame_free(&e);
+                 p->st.el_dropped++;
+                 continue;
+             }
+             b = take(p, 0);
+-            if (!timed || a == t)
++            if (!timed || diff <= PAIR_TOLERANCE_US)
+                 e = take(p, 1);
+         } else
+             b = take(p, 0);
