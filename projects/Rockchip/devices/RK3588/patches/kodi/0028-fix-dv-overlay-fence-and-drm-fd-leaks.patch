@@ -1,0 +1,49 @@
+From: momokind <momokind2002@gmail.com>
+Subject: [PATCH] VideoPlayer/DRM: fix overlay sync_file and video plane fence FD leaks
+
+1. CDVTunnelDRMPRIME::DrawOverlay() left m_overlayFence open when areas.empty()
+   cleared m_overlayShown, and Render() still dup()'d m_overlayFence into
+   frame.overlay_fd even when frame.overlay was nullptr. Because pi_render()
+   only consumes overlay_fd when an overlay is attached, every subtitle-free
+   frame leaked an anon_inode:sync_file descriptor.
+2. CDRMAtomic::DestroyDrm() did not close a pending m_videoInFenceFd.
+
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
+@@ -506,6 +506,11 @@ bool CDVTunnelDRMPRIME::DrawOverlay(const std::function<std::vector<CRect>()>& d
+   {
+     m_overlayChanged |= m_overlayShown >= 0;
+     m_overlayShown = -1;
++    if (m_overlayFence >= 0)
++    {
++      close(m_overlayFence);
++      m_overlayFence = -1;
++    }
+     return true;
+   }
+ 
+@@ -687,7 +692,8 @@ CVideoBufferDRMPRIME* CDVTunnelDRMPRIME::Render(CVideoBufferDRMPRIME* buffer, in
+     frame.overlay_bottom_up = 1;
+   }
+   // the overlay's sync_file: each render takes one
+-  auto overlayFence = [this] { return m_overlayFence >= 0 ? dup(m_overlayFence) : -1; };
++  auto overlayFence = [this, &frame]
++  { return frame.overlay && m_overlayFence >= 0 ? dup(m_overlayFence) : -1; };
+ 
+   frame.overlay_fd = overlayFence();
+   int ret = pi_render(m_engine, &frame, output->m_output, &fence);
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.cpp
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+@@ -266,6 +266,12 @@ void CDRMAtomic::FlipPage(struct gbm_bo* bo, bool rendered, bool videoLayer)
+ 
+ void CDRMAtomic::DestroyDrm()
+ {
++  if (m_videoInFenceFd != -1)
++  {
++    close(m_videoInFenceFd);
++    m_videoInFenceFd = -1;
++  }
++
+   CDRMUtils::DestroyDrm();
+ }
+ 

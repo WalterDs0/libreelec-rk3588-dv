@@ -1,0 +1,25 @@
+From: momokind <momokind2002@gmail.com>
+Subject: [PATCH] pi_engine: close unused overlay_fd when no overlay is attached
+
+pi_render() documents that frame->overlay_fd is taken by the call.
+Previously, when frame->overlay was NULL, drawn_fd was initialized to -1
+without closing frame->overlay_fd, leaking anon_inode:sync_file descriptors
+if a caller passed a valid overlay_fd without an overlay.
+
+--- a/engine/pi_engine.c
++++ b/engine/pi_engine.c
+@@ -3127,7 +3127,13 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
+     if (release_fd)
+         *release_fd = -1;
+     int acquire_fd = f ? f->acquire_fd : -1;
+-    int drawn_fd = f && f->overlay ? f->overlay_fd : -1;
++    int drawn_fd = f ? f->overlay_fd : -1;
++    if (!f || !f->overlay) {
++        if (drawn_fd >= 0) {
++            close(drawn_fd);
++            drawn_fd = -1;
++        }
++    }
+     int rc = PI_E_INVALID;
+     if (!e->open || !f || !f->bl || !o || o->w != e->w || o->h < e->h)
+         goto out;
