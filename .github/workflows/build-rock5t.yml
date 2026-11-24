@@ -1,6 +1,9 @@
 name: Build LibreELEC RK3588 (Rock 5T)
 
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       uboot_system:
@@ -8,11 +11,26 @@ on:
         required: true
         default: 'rock-5t'
         type: string
+      publish_release:
+        description: 'Publish firmware (.img.gz, .tar, SHA256SUMS.txt) to GitHub Releases'
+        required: false
+        default: true
+        type: boolean
+      release_tag:
+        description: 'Optional release tag (default: <uboot_system>-YYYYMMDD-<shortsha>)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+    env:
+      UBOOT_SYSTEM: ${{ inputs.uboot_system || 'rock-5t' }}
 
     steps:
       - name: Free Disk Space
@@ -31,6 +49,8 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 10
 
       - name: Install LibreELEC build dependencies
         run: |
@@ -68,7 +88,7 @@ jobs:
           export CCACHE_DIR="${HOME}/.ccache/target"
           export LOCAL_CCACHE_DIR="${HOME}/.ccache/local"
           export CCACHE_CACHE_SIZE="5G"
-          PROJECT=Rockchip DEVICE=RK3588 ARCH=aarch64 UBOOT_SYSTEM="${{ inputs.uboot_system }}" make image
+          PROJECT=Rockchip DEVICE=RK3588 ARCH=aarch64 UBOOT_SYSTEM="${UBOOT_SYSTEM}" make image
 
       - name: Save LibreELEC sources cache
         if: ${{ !cancelled() && steps.cache-sources.outputs.cache-hit != 'true' }}
@@ -84,14 +104,64 @@ jobs:
           path: ~/.ccache
           key: le-ccache-rk3588-${{ github.sha }}
 
-      - name: List target artifacts
-        run: ls -lh target/
+      - name: Generate checksums and release metadata
+        id: release-meta
+        run: |
+          cd target
+          sha256sum *.img.gz *.tar > SHA256SUMS.txt
+          ls -lh
+          cd ..
+
+          SHORT_SHA="${GITHUB_SHA::7}"
+          BUILD_DATE="$(date -u +%Y%m%d)"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          elif [ -n "${{ inputs.release_tag }}" ]; then
+            TAG="${{ inputs.release_tag }}"
+          else
+            TAG="${UBOOT_SYSTEM}-${BUILD_DATE}-${SHORT_SHA}"
+          fi
+          TITLE="LibreELEC RK3588 (${UBOOT_SYSTEM}) - ${TAG}"
+
+          {
+            echo "## LibreELEC RK3588 (${UBOOT_SYSTEM}) Firmware"
+            echo ""
+            echo "- **Tag**: \`${TAG}\`"
+            echo "- **Commit**: \`${GITHUB_SHA}\`"
+            echo "- **Target**: \`PROJECT=Rockchip ARCH=aarch64 DEVICE=RK3588 UBOOT_SYSTEM=${UBOOT_SYSTEM}\`"
+            echo ""
+            echo "### Files"
+            echo "- \`*.img.gz\`: Full disk image for initial flashing (SD / eMMC / NVMe)"
+            echo "- \`*.tar\`: Update package (copy to \`/storage/.update/\` and reboot)"
+            echo "- \`SHA256SUMS.txt\`: SHA-256 checksums"
+            echo ""
+            echo "### Recent Changes"
+            git log -n 10 --pretty=format:'- %h %s'
+            echo ""
+          } > target/RELEASE_NOTES.md
+
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "title=${TITLE}" >> "${GITHUB_OUTPUT}"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: LibreELEC-RK3588-${{ inputs.uboot_system }}
+          name: LibreELEC-RK3588-${{ env.UBOOT_SYSTEM }}
           path: |
             target/*.img.gz
             target/*.tar
+            target/SHA256SUMS.txt
           retention-days: 14
+
+      - name: Publish GitHub Release
+        if: ${{ github.ref_type == 'tag' || inputs.publish_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release-meta.outputs.tag }}
+          name: ${{ steps.release-meta.outputs.title }}
+          body_path: target/RELEASE_NOTES.md
+          make_latest: true
+          files: |
+            target/*.img.gz
+            target/*.tar
+            target/SHA256SUMS.txt
