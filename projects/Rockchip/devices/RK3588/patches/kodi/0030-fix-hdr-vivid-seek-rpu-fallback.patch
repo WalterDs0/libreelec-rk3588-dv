@@ -1,0 +1,82 @@
+From: momokind <momokind2002@gmail.com>
+Subject: [PATCH] VideoPlayer: fix HDR Vivid to DV P8.1 RPU loss on B-frames and seeks
+
+1. In CDVDVideoCodecDRMPRIME::GetPicture(), erase only the matched PTS
+   entry from m_hdrVividT35Queue instead of erasing [begin(), next(it)),
+   which discarded out-of-order P/B-frame T.35 entries queued in decode
+   order. Also fall back to the oldest queued entry when framePts does not
+   match, and avoid duplicating entries on EAGAIN retries in AddData().
+2. In hdrvivid_dovi_next(), when a frame right after seek (post
+   hdrvivid_dovi_scene_reset) carries no HDR Vivid metadata yet and s->made
+   is NULL, synthesize a valid default Profile 8.1 fallback AVDOVIMetadata
+   instead of returning NULL, preventing CDVTunnelDRMPRIME from hitting
+   "a frame without Dolby Vision metadata / render: invalid RPU".
+
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/HDRVividDovi.c
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/HDRVividDovi.c
+@@ -279,8 +279,27 @@ const AVDOVIMetadata *hdrvivid_dovi_next(struct hdrvivid_dovi_scene *s,
+     av_free(first);
+   }
+ 
+-  if (!s->made)
+-    return NULL;
++  if (!s->made) {
++    AVMasteringDisplayMetadata default_mastering;
++    if (!mastering || !mastering->has_luminance) {
++      memset(&default_mastering, 0, sizeof(default_mastering));
++      default_mastering.has_luminance = 1;
++      default_mastering.max_luminance = (AVRational){4000, 1};
++      default_mastering.min_luminance = (AVRational){1, 10000};
++      mastering = &default_mastering;
++    }
++    size_t bytes = 0;
++    AVDOVIMetadata *fallback = make_profile81_metadata(0, 3079, 1000,
++                                                       mastering, light, true, &bytes);
++    if (!fallback)
++      return NULL;
++    s->made = fallback;
++    s->size = bytes;
++    s->have_from = false;
++    *repeated = true;
++    *size = bytes;
++    return s->made;
++  }
+   *repeated = true;
+   *size = s->size;
+   return s->made;
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+@@ -487,9 +487,13 @@ bool CDVDVideoCodecDRMPRIME::AddData(const DemuxPacket& packet)
+     CDVHdrVivid::AccessUnit au = CDVHdrVivid::Read(packet.pData, static_cast<size_t>(packet.iSize), m_dvLengthSize);
+     if (!au.t35.empty())
+     {
+-      m_hdrVividT35Queue.emplace_back(avpkt->pts, std::move(au.t35));
+-      if (m_hdrVividT35Queue.size() > 64)
+-        m_hdrVividT35Queue.pop_front();
++      if (m_hdrVividT35Queue.empty() || m_hdrVividT35Queue.back().first != avpkt->pts ||
++          avpkt->pts == AV_NOPTS_VALUE)
++      {
++        m_hdrVividT35Queue.emplace_back(avpkt->pts, std::move(au.t35));
++        if (m_hdrVividT35Queue.size() > 64)
++          m_hdrVividT35Queue.pop_front();
++      }
+     }
+   }
+ #endif
+@@ -768,10 +772,15 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecDRMPRIME::GetPicture(VideoPicture* pVideo
+           if (it->first == framePts)
+           {
+             t35 = std::move(it->second);
+-            m_hdrVividT35Queue.erase(m_hdrVividT35Queue.begin(), std::next(it));
++            m_hdrVividT35Queue.erase(it);
+             break;
+           }
+         }
++        if (t35.empty() && !m_hdrVividT35Queue.empty())
++        {
++          t35 = std::move(m_hdrVividT35Queue.front().second);
++          m_hdrVividT35Queue.pop_front();
++        }
+       }
+       const AVFrameSideData* sdMaster =
+           av_frame_get_side_data(m_pFrame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);

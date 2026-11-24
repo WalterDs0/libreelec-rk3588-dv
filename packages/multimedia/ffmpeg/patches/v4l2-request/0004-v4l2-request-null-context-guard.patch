@@ -1,0 +1,42 @@
+From: momokind <momokind2002@gmail.com>
+Subject: [PATCH] v4l2_request: do not dereference a torn-down hwaccel context
+
+When the decoder selects a new format (new SPS / new sequence), FFmpeg calls
+ff_get_format(), which uninitializes the current hwaccel and reinitializes it.
+Frames decoded before that still carry a deferred post_process callback whose
+hwaccel_priv points at the now-released V4L2RequestContext (fctxi == NULL,
+frames_ref unreffed, output buffers closed). When such a frame is eventually
+returned to the application, v4l2_request_post_process() ->
+v4l2_request_wait_on_capture() dereferences ctx->fctxi and crashes with
+SIGSEGV (reproduced on RK3588 with HEVC frame threading).
+
+There is nothing to synchronize against once the context is gone: the CAPTURE
+buffer is kept alive by the frame reference. Check the context and skip the
+wait instead of dereferencing NULL.
+
+--- a/libavcodec/v4l2_request.c
++++ b/libavcodec/v4l2_request.c
+@@ -220,6 +220,9 @@
+ 
+ static int v4l2_request_wait_on_capture(V4L2RequestContext *ctx, uint32_t index)
+ {
++    if (!ctx || !ctx->fctxi)
++        return AVERROR(EINVAL);
++
+     enum v4l2_buf_type type = ctx->fctxi->capture.format.type;
+     struct pollfd pollfd = {
+         .fd = ctx->fctxi->video_fd,
+@@ -496,6 +499,13 @@
+     FrameDecodeData *fdd = frame->private_ref;
+     V4L2RequestContext *ctx = fdd->hwaccel_priv;
+ 
++    /* The hwaccel context may have been uninitialized and reinitialized
++     * after this frame was decoded (e.g. ff_get_format() on a new SPS
++     * while the frame was still queued). There is nothing to wait on
++     * then: the CAPTURE buffer is kept alive by the frame reference. */
++    if (!ctx || !ctx->fctxi)
++        return 0;
++
+     // Wait on CAPTURE buffer before returning the frame to application
+     return v4l2_request_wait_on_capture(ctx, index);
+ }

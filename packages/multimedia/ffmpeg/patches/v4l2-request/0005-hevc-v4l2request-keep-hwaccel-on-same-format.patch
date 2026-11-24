@@ -1,0 +1,57 @@
+From: momokind <momokind2002@gmail.com>
+Subject: [PATCH] hevc: keep the v4l2request hwaccel when only the SPS payload changes
+
+Some streams (HDR Vivid WEB-DL, for instance) repeat their parameter sets
+with a new SPS payload but identical format-relevant fields. compare_sps()
+compares the raw NAL bytes, so such an SPS becomes a new HEVCSPS object and
+hevc_frame_start() calls get_format() again. ff_get_format() uninitializes
+the current hwaccel first, which for v4l2request tears down the whole V4L2
+session and recreates its buffers. That happens on every repeated parameter
+set and causes stalls, dropped packets on buffer allocation failures and,
+with frames still queued, a crash in v4l2_request_wait_on_capture().
+
+Keep the hwaccel when the format-relevant SPS fields (pixel format,
+dimensions, bit depth) and the single-layer VPS layout are unchanged.
+Other hwaccels and real format changes still go through get_format().
+
+--- a/libavcodec/hevc/hevcdec.c
++++ b/libavcodec/hevc/hevcdec.c
+@@ -3224,6 +3224,21 @@
+     if (l->sps != sps) {
+         const HEVCSPS *sps_base = s->layers[0].sps;
+         enum AVPixelFormat pix_fmt = sps->pix_fmt;
++        /*
++         * A repeated parameter set can carry a different payload while the
++         * format stays the same (an HDR Vivid SPS VUI that changes per GOP,
++         * for instance). Re-running get_format() would tear the hwaccel
++         * down: for v4l2request that recreates the entire V4L2 session and
++         * all of its buffers for no reason.
++         */
++        const int same_format = l->sps &&
++                                sps->pix_fmt == l->sps->pix_fmt &&
++                                sps->width == l->sps->width &&
++                                sps->height == l->sps->height &&
++                                sps->bit_depth == l->sps->bit_depth &&
++                                sps->vps && l->sps->vps &&
++                                sps->vps->nb_layers < 2 &&
++                                l->sps->vps->nb_layers < 2;
+ 
+         if (l != &s->layers[0]) {
+             if (!sps_base) {
+@@ -3264,7 +3279,15 @@
+         if (l == &s->layers[0]) {
+             export_stream_params(s, sps);
+ 
+-            ret = get_format(s, sps);
++            if (same_format && s->avctx->hwaccel &&
++                !strcmp(s->avctx->hwaccel->name, "hevc_v4l2request"))
++            {
++                ret = s->avctx->pix_fmt;
++            }
++            else
++            {
++                ret = get_format(s, sps);
++            }
+             if (ret < 0) {
+                 set_sps(s, l, NULL);
+                 return ret;
