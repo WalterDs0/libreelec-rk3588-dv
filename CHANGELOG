@@ -1,13 +1,43 @@
-LibreELEC CHANGELOG
-==================
+LibreELEC RK3588 / Rock 5T Dolby Vision CHANGELOG
+=================================================
 
-To view recent changes/commits to the project (master branch) please visit:
+## 2026-11-23
 
+### Dolby Vision Profile 7 Dual-Track & Stability
+- Reworked dual-track Profile 7 (Blu-ray ISO/M2TS) playback into two independent decoders (BL + EL via `DemuxPacket::elData/elSize/elPts`, Kodi patches `0023`–`0025`).
+- Take Dolby Vision RPU metadata from the enhancement layer frame when present (`0026`), and log refused RPU details in `pi-dv-engine` (`0004`).
+- Allow repeated non-decreasing pivots (e.g. `0,0,1023` on Transformers 2 UHD Blu-ray) in `pi-dv-engine` planner and reference composer (`0005`).
+- Changed `DemuxPacket::elPts` to `double` (`0027`) and added `PAIR_TOLERANCE_US` (2 ms) to `pi-dv-engine` pairer (`0006`) to eliminate rounding-induced unpaired frame drops.
+- Added dual-track DV Profile 7 demuxer pairing (`0014`, including Blu-ray TS PID `0x1011`/`0x1015` pairing without PMT `HDMV` descriptor) and Annex-B EL support (`0015`).
+- Allowed `ext_mapping_idc` in RPU (`pi-dv-engine 0003`), preserved dirty GUI frames (`0009`), and cleared DV state on init (`0013`).
+
+### HDMI Audio Passthrough
+- Enabled HDMI audio passthrough UI (`appliance.xml` `<visible>true</visible>`, default `ALSA:hdmi:CARD=hdmi0,DEV=0`) and ALSA `hdmi0`/`hdmi1` mappings (`simple-card.conf`).
+- Updated `AESinkALSA` (`0021`) to detect `sysdefault:CARD=hdmiX` via ELD, open `hw:` for passthrough with `IEC958 Playback Default`, and restore PCM status afterwards.
+- Added `dw-hdmi-qp` kernel patch (`rockchip-0193`) to enable 8-channel `AUD_HBR` mode over I2S when `IEC958_AES0_NONAUDIO` is active (TrueHD / DTS-HD MA).
+
+### HDR Vivid, Subtitles & Cloud Blu-ray
+- Added real-time HDR Vivid to Dolby Vision Profile 8.1 conversion in `DVDDemuxFFmpeg` and `DVDVideoCodecDRMPRIME` (`0020`).
+- Added local Chinese PGS subtitle OCR identification and fast stream switch without seeking (`0019`, CPU `onnxruntime 1.23.2` + `ppocrv5-mobile-rec-int8.onnx`).
+- Added cloud Blu-ray direct play and UDF/ISO block caching optimizations (`0018`).
+- Added Chinese subtitle language preferences/priority (`0016`) and dynamic subtitle vertical offset (`0017`).
+
+## 2026-11-22
+
+- Enabled Standard (TV-led) Dolby Vision support in Kodi 22 Piers for RK3588 (`0001`–`0012`, `DOLBY_VISION_SUPPORT="yes"`).
+- Attached DRM `Broadcast RGB` connector property defaulting to Full range (`rockchip-0192`).
+- Fixed `pi-dv-engine` `dvbench` DRM hwdevice fallback, Rockchip connector props, and `v4l2request` preference for RK3588.
+
+## 2026-11-21
+
+- Added Linux 6.19 DRM HDMI `"Dolby Vision"` property, Dolby VSIF attachment, and VOP2 YUV background fixes (`rockchip-0188`–`0191`).
+- Integrated `pi-dv-engine` (`0.5.0`) with linear `NV15` input support (`0001-add-nv15-linear-support.patch`).
+
+## 2026-11-20
+
+- Initial LibreELEC 13 (Rockchip RK3588 / Radxa Rock 5T) baseline with Linux 6.19.0, Mesa PanVK Vulkan, and GitHub Actions build workflow (`.github/workflows/build-rock5t.yml`).
+
+---
+
+Upstream LibreELEC CHANGELOG:
 https://github.com/LibreELEC/LibreELEC.tv/commits/master
-
-To compare commits between versions use a formatted URL like:
-
-https://github.com/LibreELEC/LibreELEC.tv/compare/3.2.3...3.2.4
-
-If you have questions on differences between releases please ask them in the
-LibreELEC website forums or IRC support channel.
