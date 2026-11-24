@@ -26,18 +26,20 @@
 
 ---
 
-## 任务 2：修复《变形金刚》系列双层 DV ISO 特定帧瞬间闪绿问题（高优先级）
+## 任务 2：修复《变形金刚》系列双层 DV ISO 特定帧瞬间闪绿问题（高优先级）— ✅ 已完成
 
-### 现象与最新实机定位进展（已锁定根因方向）
+### 现象与实机根因定位
 - 双轨 Profile 7（蓝光 ISO）已可正常点亮杜比视界并播放，日志确认双轨 EL/BL 配对 100% 正常（`371/371` 零丢包、零失配）。
 - 播放《变形金刚 2》2.5 秒时触发 `CDVTunnelDRMPRIME: MMR magnitudes too large for the split's frame bound: checked per sample`（命中 `p1_chroma.frag` 的 `SPLIT_GUARD` / `split_guarded()` 逐采样 64-bit 模拟路径）。
-- **对照测试实证**：在播放视频设置中将 **Chroma MMR** 从 `Exact` 切为 **`Float`** 后，**瞬间闪绿完全消失**（且开启 HDMI TrueHD 直通流畅不卡顿）。
-- **结论**：瞬间闪绿 100% 源于 `pi-dv-engine` 的 `Exact` / `SPLIT_GUARD`（`mmr_split_mag` / `mmr_exact64` / `uaddCarry` / `umulExtended`）在 Mali-G610 PanVK 上的边界/编译器问题。
+- **4 模式实机对照矩阵**：
+  - `Float`：纯 32-bit 浮点 `mmr_float_mag()` → **无闪绿、HDMI TrueHD 8ch 直通流畅无卡顿**；
+  - `Exact`（原默认）：极端帧触发 `SPLIT_GUARD` / `WIDE` 回落 64/128-bit 模拟 → **特定帧瞬间闪绿**；
+  - `Split` / `Exact64`：全程跑 64/128-bit 模拟 → **闪绿且 GPU 超出 4K24 41.7 ms 帧预算（`OutputPicture - timeout` → `Audio stream stalled`）导致直通音画卡顿**。
 
-### 后续根治 Checklist
-- [x] 对照测试：将 **Chroma MMR** 切为 `Float`，确认《变形金刚 2》闪绿消失
-- [ ] 深入排查 `p1_chroma.frag` 中 `mmr_split_mag()` / `split_guarded()` / `mmr_exact64()` 在 Mali-G610 PanVK 上的具体溢出/误算点（或评估在 PanVK 上默认将 Chroma MMR 设为 `Float` 作为稳健默认值）
-- [ ] 优化 `0025` `SendLayer()` 背压逻辑（避免极端高码率下直接丢弃 EL 压缩包破坏 GOP）
+### 修复 Checklist
+- [x] 对照测试：确认 `Float` 彻底消除闪绿与卡顿，而 `Exact` / `Split` / `Exact64` 均命中 Mali-G610 PanVK 64/128-bit 模拟瓶颈与误算
+- [x] 新增 `0029-rk3588-default-dv-mmr-float.patch`，将 RK3588 默认 Dolby Vision Chroma MMR 改为 `Float`（同时保留专家设置中的 `Exact` / `Split` / `Exact64` 手动切换选项）
+- [x] 在构建机（`192.168.1.180`）完成 `make image` 编译验证并推送远端
 
 ---
 

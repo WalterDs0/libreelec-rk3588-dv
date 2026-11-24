@@ -1,0 +1,43 @@
+From: momokind <momokind2002@gmail.com>
+Subject: [PATCH] RK3588: default Dolby Vision Chroma MMR arithmetic to Float
+
+On RK3588 (Mali-G610 MC4 with Mesa PanVK), heavy Profile 7 FEL discs whose
+RPU triggers SPLIT_GUARD / mmr_exact64() or mmr_wide() (128-bit emulated MMR)
+exceed the 4K24 frame budget and exhibit momentary green flashes and audio
+stuttering. Defaulting Chroma MMR to Float avoids the 64/128-bit emulated
+shader paths while keeping Exact / Split / Exact (64-bit) selectable in
+Expert settings.
+
+--- a/system/settings/settings.xml
++++ b/system/settings/settings.xml
+@@ -375,7 +375,7 @@
+             <dependency type="enable" setting="videoplayer.allowedhdrformats" operator="contains">0</dependency>
+           </dependencies>
+           <level>3</level>
+-          <default>0</default>
++          <default>3</default>
+           <constraints>
+             <options>
+               <option label="36649">0</option>
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
+@@ -47,7 +47,7 @@
+       bool operator==(const Metadata& other) const = default;
+     };
+ 
+-    pi_mmr_mode mmr = PI_MMR_EXACT;
++    pi_mmr_mode mmr = PI_MMR_FLOAT;
+     pi_filters filters = PI_FILTERS_CB1;
+     pi_el_upscale elUpscale = PI_EL_BILINEAR;
+     //! render the enhancement layer where the RPU needs it (FEL); false: the base layer alone
+--- a/xbmc/cores/VideoSettings.cpp
++++ b/xbmc/cores/VideoSettings.cpp
+@@ -46,7 +46,7 @@
+   m_DolbyVision = true;
+   m_DolbyVisionEL = VS_DOLBYVISION_EL_AUTO;
+   m_DolbyVisionUpscale = VS_DOLBYVISION_UPSCALE_BILINEAR;
+-  m_DolbyVisionMMR = VS_DOLBYVISION_MMR_EXACT;
++  m_DolbyVisionMMR = VS_DOLBYVISION_MMR_FLOAT;
+   m_DolbyVisionFilters = VS_DOLBYVISION_FILTERS_CB1;
+   m_DolbyVisionInfoframe = VS_DOLBYVISION_INFOFRAME_AUTO;
+   m_DolbyVisionCM4 = VS_DOLBYVISION_CM4_OFF;
