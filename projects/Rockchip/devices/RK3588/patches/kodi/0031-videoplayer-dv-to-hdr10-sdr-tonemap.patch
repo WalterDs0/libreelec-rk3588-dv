@@ -538,17 +538,16 @@ index 1111111..2222222 100644
    o.pipeline_cache = tunnel->m_pipelineCache.c_str();
    o.log = Log;
    o.log_level = PI_LOG_INFO;
-@@ -312,6 +317,9 @@ std::unique_ptr<CDVTunnelDRMPRIME> CDVTunnelDRMPRIME::Create(const VideoPicture&
+@@ -312,6 +317,8 @@ std::unique_ptr<CDVTunnelDRMPRIME> CDVTunnelDRMPRIME::Create(const VideoPicture&
    bytes = (bytes + 4095) & ~static_cast<uint64_t>(4095);
  
    tunnel->m_pool = std::make_shared<CDVTunnelOutputPool>();
-+  const uint32_t drmFormat =
-+      options.outputMode == PI_OUT_DV_STANDARD ? DRM_FORMAT_XRGB8888 : DRM_FORMAT_XRGB2101010;
-+  const uint8_t colorBits = options.outputMode == PI_OUT_DV_STANDARD ? 8 : 10;
++  const uint32_t drmFormat = DRM_FORMAT_XRGB8888;
++  const uint8_t colorBits = 8;
    for (int i = 0; i < OUTPUTS; i++)
    {
      int fd = AllocateDmaBuf(bytes);
-@@ -321,7 +329,8 @@ std::unique_ptr<CDVTunnelDRMPRIME> CDVTunnelDRMPRIME::Create(const VideoPicture&
+@@ -321,7 +328,8 @@ std::unique_ptr<CDVTunnelDRMPRIME> CDVTunnelDRMPRIME::Create(const VideoPicture&
        return nullptr;
      }
  
@@ -558,7 +557,7 @@ index 1111111..2222222 100644
      ret = pi_output_import(tunnel->m_engine, fd, width, height, stride, bytes, &output->m_output);
      if (ret != PI_OK)
      {
-@@ -608,6 +617,10 @@ bool CDVTunnelDRMPRIME::SetOptions(const Options& options)
+@@ -608,6 +616,10 @@ bool CDVTunnelDRMPRIME::SetOptions(const Options& options)
    o.mmr = options.mmr;
    o.filters = options.filters;
    o.el_upscale = options.elUpscale;
@@ -569,7 +568,7 @@ index 1111111..2222222 100644
  
    int ret = pi_engine_configure(m_engine, &o);
    if (ret == PI_OK)
-@@ -762,7 +775,18 @@ void CDVTunnelDRMPRIME::Describe(DRMPRIME::PlayerInfo& info, float fps) const
+@@ -762,7 +774,18 @@ void CDVTunnelDRMPRIME::Describe(DRMPRIME::PlayerInfo& info, float fps) const
    info["Info.ChromaMapping"] =
        m_mmr ? StringUtils::Format("MMR · {}", MMRName(m_options.mmr)) : "Polynomial";
    info["Info.Filters"] = m_options.filters == PI_FILTERS_PHASE ? "Phase" : "CB1";

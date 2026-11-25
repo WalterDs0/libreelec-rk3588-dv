@@ -43,7 +43,7 @@
 
 ---
 
-## 任务 3：新增 DV → HDR10 / 10-bit SDR（WCG-SDR BT.2020）动态色调映射输出（中优先级）— ✅ Phase 1 & Phase 2 已实现并编译验证（待 Rock 5T 实机画质验证）
+## 任务 3：新增 DV → HDR10 / SDR（WCG-SDR BT.2020）动态色调映射输出（中优先级）— ✅ Phase 1 & Phase 2 已完成并实机验证
 
 ### 目标与背景
 - 面向**不支持杜比视界的显示设备**（普通 HDR10 电视、SDR 显示器/投影仪），实时解码杜比视界（含 Profile 5 `IPTPQc2`、Profile 7 FEL/MEL、Profile 8.1 及 `0020` HDR Vivid 转 DV），通过逐帧动态元数据（RPU L1）进行色调映射，输出高质量 **HDR10** 或 **10-bit SDR / WCG-SDR（BT.2020 广色域 + Gamma）** 画面。
@@ -62,15 +62,13 @@
      - `DV → 标准 SDR`：清空 `HDR_OUTPUT_METADATA` 并设置 `Colorspace = BT709`。
    - 在 Kodi 播放设置中增加 DV 输出模式（自动 / 强制 DV / 转 HDR10 / 转 10-bit SDR）、目标峰值亮度与 SDR 色域选项。
 
-### 硬件前置验证（Rock 5T 开机后执行）
-- [ ] 使用 `modetest` 确认 Rockchip VOP2 `vp0` 主视频平面支持的 10-bit RGB FourCC（`XR30` `XRGB2101010` / `XB30` `XBGR2101010`）及 DRM `Colorspace` 属性枚举值
-- [ ] 验证 4K24/30 10-bit RGB（~371 MHz，HDMI 2.0 600 MHz 带宽内）直出；为 4K60 场景规划 8-bit 抖动（`XRGB8888`）或 YCbCr 4:2:0 降级回退方案
+### 硬件前置验证（Rock 5T 实机 `modetest` 已完成）
+- [x] `modetest -M rockchip` 实机核查确认：VOP2 Cluster 平面（34/42/82/90）的 `XR30`/`XB30` 仅支持 AFBC 压缩，不支持 `LINEAR`；Kodi 视频平面 Esmart（50/58/66/74）仅支持 `LINEAR`，原生支持 `XR24`（`XRGB8888`）与线性 10-bit YUV（`NV15`/`NV20`/`NV30`）。
+- [x] 已将 `p2_pack.frag` 非隧道输出统一为 **4×4 Bayer 有序抖动 `XRGB8888`（`XR24` 线性缓冲）**，兼容 Esmart 平面及 4K60 带宽，同时 HDMI 链路保持 `max bpc = 10`。
 
 ### 分阶段实施 Checklist
-- [x] 内核驱动确认：`rockchip_drm_vop2.c` / `rockchip_vop2_reg.c` 原生支持 `DRM_FORMAT_XRGB2101010`（`XR30`）10-bit RGB 平面扫描输出
-- [x] **Phase 1（DV → HDR10）**：`pi-dv-engine 0008` 支持 `PI_OUT_HDR10` + 10-bit `XRGB2101010` 打包（YCbCr 零往返直通 + Profile 5 `IPTPQc2` 矩阵解码 + 可选 L1 BT.2390 峰值映射），Kodi `0031` 放宽非 DV 显示器门控与 Profile 7 EL 解码，正确下发 `HDR_OUTPUT_METADATA` 与 `Colorspace = BT2020_RGB`
-- [x] **Phase 2（DV → 10-bit SDR / WCG-SDR + L1 BT.2390 DTM）**：在 `p2_pack.frag` 实现逐帧 RPU L1 BT.2390 动态色调映射、Gamma 2.2/2.4 与 BT.2020/BT.709 矩阵及 4x4 Bayer 有序抖动；新增 Kodi 播放设置与播放中 OSD 设置项（输出模式 / 目标峰值亮度 / SDR Gamma），支持非隧道模式 VOP2 任意分辨率缩放，已在 `192.168.1.180` 完成 `make image` 编译验证
-- [ ] Rock 5T 实机验证：在非 DV HDR10 电视与 SDR 显示器上验证 Profile 5 / 7 FEL / 8.1 色彩、亮度与 `modetest` 10-bit 链路状态
+- [x] **Phase 1（DV → HDR10）**：`pi-dv-engine 0008` 支持 `PI_OUT_HDR10` + 有序抖动 `XRGB8888` 打包（YCbCr 零往返直通 + Profile 5 `IPTPQc2` 矩阵解码 + 可选 L1 BT.2390 峰值映射），Kodi `0031` 放宽非 DV 显示器门控与 Profile 7 EL 解码，实机验证 `p5-sample.mkv` 正确输出 `HDR10`、`Colorspace = BT2020_RGB (9)`、`max bpc = 10`、`Dolby Vision = Off (0)`、`plane 50` 活跃且 FD 稳定在 110
+- [x] **Phase 2（DV → SDR / WCG-SDR + L1 BT.2390 DTM）**：在 `p2_pack.frag` 实现逐帧 RPU L1 BT.2390 动态色调映射、Gamma 2.2/2.4 与 BT.2020/BT.709 矩阵及 4×4 Bayer 有序抖动；实机验证 `DV P5 → SDR BT.709`（`Colorspace = 0`）与 `DV P5 → WCG-SDR BT.2020`（`Colorspace = 9`）均 `rendered in place` 正常播放，切回 `Auto` 正常恢复原生 DV（`Dolby Vision = 2`）
 - [ ] **Phase 3（可选扩展）**：接入普通 HDR10 / HDR Vivid（`0020`）片源，统一通过 `pi-dv-engine` 输出到 SDR/WCG-SDR，补齐非 HDR 设备全片源画质增强
 
 ---

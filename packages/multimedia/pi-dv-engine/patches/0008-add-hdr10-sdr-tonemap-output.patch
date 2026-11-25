@@ -189,9 +189,9 @@ index 1111111..2222222 100644
 +            enc = pow(clamp(rgb, 0.0, 1.0), vec3(P.tm_cfg.y));
 +        }
 +    }
-+    float d = bayer4x4(x, y) * (1.0 / 1023.0);
-+    uvec3 q = uvec3(clamp(round((enc + d) * 1023.0), 0.0, 1023.0));
-+    return (q.r << 20u) | (q.g << 10u) | q.b;
++    float d = bayer4x4(x, y) * (1.0 / 255.0);
++    uvec3 q = uvec3(clamp(round((enc + d) * 255.0), 0.0, 255.0));
++    return (q.r << 16u) | (q.g << 8u) | q.b;
 +}
 +
  uint finish(uint x, uint y, uint yy, uint c)
