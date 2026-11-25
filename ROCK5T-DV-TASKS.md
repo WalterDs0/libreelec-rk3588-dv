@@ -88,17 +88,17 @@
 
 ---
 
-## 任务 5：新增 AV1 杜比视界 Profile 10（P10.0 / P10.1 / P10.4）支持（中优先级）
+## 任务 5：新增 AV1 杜比视界 Profile 10（P10.0 / P10.1 / P10.4）支持（中优先级）— ✅ 已实现并编译验证（待 Rock 5T 实机验证）
 
 ### 背景与现状
-- RK3588 内置 VPU981 AV1 10-bit 硬件解码器可正常硬解，但 `0004` 中 `CDVTunnelDRMPRIME::Supports()` 硬编码仅放行 Profile 5 / 7 / 8，导致 P10.1/P10.4 回退为 HDR10/HLG，P10.0（`IPTPQc2`）因未进 `pi-dv-engine` 而紫绿偏色。
-- 本质上 **P10.0 = AV1 版 P5、P10.1 = AV1 版 P8.1、P10.4 = AV1 版 P8.4**，RPU 语法与重塑/色域公式一致。
+- RK3588 内置 VPU981 AV1 10-bit 硬件解码器（`rockchip_vpu_hw.c`）默认优先输出线性 `V4L2_PIX_FMT_NV15`，与 `pi-dv-engine` 现有 `NV15` 零拷贝管线完全兼容；FFmpeg 9.0.2 `av1dec.c` 已在所有输出帧（含 `v4l2_request`）原生解析 AV1 OBU `ITU-T T.35` DV RPU 并挂载 `AV_FRAME_DATA_DOVI_METADATA` / `AV_FRAME_DATA_DOVI_RPU_BUFFER`。
+- 本质上 **P10.0 = AV1 版 P5、P10.1 = AV1 版 P8.1、P10.4 = AV1 版 P8.4**，已通过 `0033-videoplayer-av1-dolby-vision-profile10.patch` 放行并完善信息展示。
 
 ### 实施 Checklist
-- [ ] 核对 RK3588 VPU981 AV1 硬解输出的 10-bit DRM 像素格式（`NV15` / `P010`）及 `pi-dv-engine` 兼容性
-- [ ] 核对 FFmpeg V4L2-request AV1 硬解是否把 AV1 OBU `ITU-T T.35` DV RPU 正确挂到 `AV_FRAME_DATA_DOVI_RPU_BUFFER`（若未挂则在 `DVDVideoCodecDRMPRIME` 侧带提取）
-- [ ] 在 `CDVTunnelDRMPRIME::Supports()` 与 `pi-dv-engine` 放行 Profile 10（按 `dv_bl_signal_compatibility_id` 映射 P10.0→P5、P10.1/10.4→P8）
-- [ ] 使用 P10.0 / P10.1 测试片在 Rock 5T 上实机验证点亮杜比视界且色彩正常
+- [x] 核对 RK3588 VPU981 AV1 硬解输出的 10-bit DRM 像素格式（`rockchip_vpu981_postproc_fmts` 默认优先 `V4L2_PIX_FMT_NV15`）及 `pi-dv-engine` 兼容性
+- [x] 核对 FFmpeg 9.0.2 V4L2-request AV1 硬解已通过 `export_metadata()` / `export_itut_t35()` 原生挂载 `AV_FRAME_DATA_DOVI_METADATA` 与 `AV_FRAME_DATA_DOVI_RPU_BUFFER`
+- [x] 在 `CDVTunnelDRMPRIME::Supports()` / `Create()` 放行 Profile 10（按 `dv_bl_signal_compatibility_id` 映射 P10.0→P5、P10.1/10.4→P8），同步完善 `DRMPRIMEPlayerInfo`、`DVDStreamInfo`、`DVDFileInfo` 与 `VideoPlayer` 的 Profile 10.x 识别，已在 `192.168.1.180` 完成 `make image` 编译验证
+- [ ] Rock 5T 实机验证：使用 P10.0 / P10.1 测试片验证点亮杜比视界且色彩正常
 
 ---
 

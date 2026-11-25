@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: momokind <momokind2002@gmail.com>
+Date: Wed, 25 Nov 2026 20:54:00 +0800
+Subject: [PATCH] [VideoPlayer] Enable AV1 Dolby Vision Profile 10 (10.0 / 10.1 / 10.4) through pi-dv-engine
+
+RK3588 VPU981 hardware AV1 10-bit decoding defaults to linear NV15 (already
+supported zero-copy by pi-dv-engine) and FFmpeg 9.0.2 av1dec natively parses
+AV1 OBU ITU-T T.35 Dolby Vision RPUs into AV_FRAME_DATA_DOVI_METADATA and
+AV_FRAME_DATA_DOVI_RPU_BUFFER.
+
+Allow Profile 10 in CDVTunnelDRMPRIME::Supports() (mapping P10.0 -> P5 and
+P10.1/P10.4 -> P8 for pi_stream_info.profile), and update DRMPRIMEPlayerInfo,
+DVDStreamInfo, DVDFileInfo, and VideoPlayer to report Profile 10.x properly.
+---
+ xbmc/cores/VideoPlayer/DVDFileInfo.cpp                          |  3 ++-
+ xbmc/cores/VideoPlayer/DVDStreamInfo.h                          |  6 ++++--
+ xbmc/cores/VideoPlayer/VideoPlayer.cpp                          |  3 ++-
+ xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DRMPRIMEPlayerInfo.cpp | 11 ++++++-----
+ xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp   |  9 ++++++---
+ 5 files changed, 20 insertions(+), 12 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
+index 1111111..2222222 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
+@@ -235,7 +235,8 @@ struct CDVTunnelDRMPRIME::Overlay
+ bool CDVTunnelDRMPRIME::Supports(const VideoPicture& picture)
+ {
+   if (picture.hdrType != StreamHdrType::HDR_TYPE_DOLBYVISION ||
+-      (picture.doviProfile != 5 && picture.doviProfile != 7 && picture.doviProfile != 8))
++      (picture.doviProfile != 5 && picture.doviProfile != 7 && picture.doviProfile != 8 &&
++       picture.doviProfile != 10))
+     return false;
+ 
+   static const bool available = []
+@@ -293,7 +294,9 @@ std::unique_ptr<CDVTunnelDRMPRIME> CDVTunnelDRMPRIME::Create(const VideoPicture&
+ 
+   tunnel->m_info.width = picture.iWidth;
+   tunnel->m_info.height = picture.iHeight;
+-  tunnel->m_info.profile = picture.doviProfile;
++  tunnel->m_info.profile = picture.doviProfile == 10
++                               ? (picture.doviCompatibility == 0 ? 5 : 8)
++                               : picture.doviProfile;
+   ret = pi_stream_open(tunnel->m_engine, &tunnel->m_info);
+   if (ret != PI_OK)
+   {
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DRMPRIMEPlayerInfo.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DRMPRIMEPlayerInfo.cpp
+index 1111111..2222222 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DRMPRIMEPlayerInfo.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DRMPRIMEPlayerInfo.cpp
+@@ -190,11 +190,11 @@ void DescribeHDR10Plus(const AVFrame* frame, DRMPRIME::PlayerInfo& info)
+ 
+ const char* BaseLayerName(const VideoPicture& picture)
+ {
+-  if (picture.doviProfile == 5)
++  if (picture.doviProfile == 5 || (picture.doviProfile == 10 && picture.doviCompatibility == 0))
+     return "IPT-PQc2 BL";
+-  if (picture.doviProfile == 8 && picture.doviCompatibility == 2)
++  if ((picture.doviProfile == 8 || picture.doviProfile == 10) && picture.doviCompatibility == 2)
+     return "SDR BL";
+-  if (picture.doviProfile == 8 && picture.doviCompatibility == 4)
++  if ((picture.doviProfile == 8 || picture.doviProfile == 10) && picture.doviCompatibility == 4)
+     return "HLG BL";
+   return "HDR10 BL";
+ }
+@@ -308,9 +308,10 @@ void DescribeDolbyVision(const VideoPicture& picture,
+   if (!picture.doviProfile)
+     return;
+ 
+-  info["Info.DV.Profile"] = picture.doviProfile == 8
+-                                ? StringUtils::Format("8.{}", picture.doviCompatibility)
+-                                : std::to_string(picture.doviProfile);
++  info["Info.DV.Profile"] =
++      (picture.doviProfile == 8 || picture.doviProfile == 10)
++          ? StringUtils::Format("{}.{}", picture.doviProfile, picture.doviCompatibility)
++          : std::to_string(picture.doviProfile);
+   info["Info.DV.Level"] = std::to_string(picture.doviLevel);
+   info["Info.DV.Layers"] = StringUtils::Format("{}{} + RPU", BaseLayerName(picture),
+                                                picture.doviProfile == 7 ? " + EL" : "");
+diff --git a/xbmc/cores/VideoPlayer/DVDStreamInfo.h b/xbmc/cores/VideoPlayer/DVDStreamInfo.h
+index 1111111..2222222 100644
+--- a/xbmc/cores/VideoPlayer/DVDStreamInfo.h
++++ b/xbmc/cores/VideoPlayer/DVDStreamInfo.h
+@@ -92,12 +92,14 @@ public:
+   // Dolby Vision profile 8 compatibility IDs 1 and 4 identify HDR10 and HLG
+   // base layers respectively.
+   bool HasHDR10DolbyVisionBaseLayer() const
+   {
+-    return dovi.dv_profile == 8 && dovi.dv_bl_signal_compatibility_id == 1;
++    return (dovi.dv_profile == 8 || dovi.dv_profile == 10) &&
++           dovi.dv_bl_signal_compatibility_id == 1;
+   }
+   bool HasHLGDolbyVisionBaseLayer() const
+   {
+-    return dovi.dv_profile == 8 && dovi.dv_bl_signal_compatibility_id == 4;
++    return (dovi.dv_profile == 8 || dovi.dv_profile == 10) &&
++           dovi.dv_bl_signal_compatibility_id == 4;
+   }
+ 
+   // AUDIO
+diff --git a/xbmc/cores/VideoPlayer/DVDFileInfo.cpp b/xbmc/cores/VideoPlayer/DVDFileInfo.cpp
+index 1111111..2222222 100644
+--- a/xbmc/cores/VideoPlayer/DVDFileInfo.cpp
++++ b/xbmc/cores/VideoPlayer/DVDFileInfo.cpp
+@@ -579,7 +579,7 @@ bool CDVDFileInfo::AddExternalSubtitleToStreamDetail(const std::string& path,
+                                 ? ""
+                                 : std::to_string(static_cast<int>(vstream->dovi.dv_profile));
+         // distinguish HDR10 from HLG base
+-        if (vstream->dovi.dv_profile == 8)
++        if (vstream->dovi.dv_profile == 8 || vstream->dovi.dv_profile == 10)
+         {
+           p->m_strHdrDetail += ".";
+           p->m_strHdrDetail +=
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.cpp b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+index 1111111..2222222 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+@@ -6605,7 +6605,7 @@ void CVideoPlayer::UpdatePlayInfo(int interval)
+       info.hdrDetail =
+           s.dovi.dv_profile == 0 ? "" : std::to_string(static_cast<int>(s.dovi.dv_profile));
+     // distinguish HDR10 from HLG base
+-    if (s.dovi.dv_profile == 8)
++    if (s.dovi.dv_profile == 8 || s.dovi.dv_profile == 10)
+     {
+       info.hdrDetail += ".";
+       info.hdrDetail += std::to_string(static_cast<int>(s.dovi.dv_bl_signal_compatibility_id));
