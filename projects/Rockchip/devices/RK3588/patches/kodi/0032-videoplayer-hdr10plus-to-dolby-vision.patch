@@ -1,0 +1,534 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: momokind <momokind2002@gmail.com>
+Date: Wed, 25 Nov 2026 20:30:00 +0800
+Subject: [PATCH] [VideoPlayer] Convert HDR10+ ST 2094-40 dynamic metadata to Dolby Vision Profile 8.1
+
+Reuse the HDR Vivid -> Dolby Vision Profile 8.1 pipeline to detect HDR10+
+streams (via container HDR_TYPE_HDR10PLUS or in-band HEVC ITU-T T.35 ST
+2094-40 SEI) and convert per-frame AVDynamicHDRPlus (maxscl, average_maxrgb,
+distribution_maxrgb) into Dolby Vision Profile 8.1 L1 dynamic metadata for
+pi-dv-engine.
+---
+ addons/resource.language.en_gb/resources/strings.po |   8 ++
+ system/settings/settings.xml                        |   6 ++
+ xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp |  49 ++++++++++
+ xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h   |   2 +
+ xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemux.h       |   1 +
+ xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp |  46 +++++++++-
+ xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h |   7 ++
+ xbmc/cores/VideoPlayer/DVDDemuxers/DVHdrVivid.cpp   |   2 +
+ xbmc/cores/VideoPlayer/DVDDemuxers/DVHdrVivid.h     |   1 +
+ xbmc/cores/VideoPlayer/DVDDemuxers/HDRVividDovi.c   |  99 ++++++++++++++++++++
+ xbmc/cores/VideoPlayer/DVDDemuxers/HDRVividDovi.h   |  11 +++
+ xbmc/cores/VideoPlayer/DVDStreamInfo.cpp            |   5 +
+ xbmc/cores/VideoPlayer/DVDStreamInfo.h              |   1 +
+ xbmc/settings/Settings.h                            |   2 +
+ 14 files changed, 239 insertions(+), 1 deletion(-)
+
+diff --git a/addons/resource.language.en_gb/resources/strings.po b/addons/resource.language.en_gb/resources/strings.po
+index 1111111..2222222 100644
+--- a/addons/resource.language.en_gb/resources/strings.po
++++ b/addons/resource.language.en_gb/resources/strings.po
+@@ -26300,3 +26300,11 @@ msgctxt "#44418"
+ msgctxt "#44419"
+ msgid "Send HDR Vivid video as Dolby Vision Profile 8.1 using metadata converted scene-by-scene from HDR Vivid MaxRGB dynamic metadata. Takes effect on the next video."
+ msgstr ""
++
++msgctxt "#44420"
++msgid "HDR10+ as Dolby Vision"
++msgstr ""
++
++msgctxt "#44421"
++msgid "Send HDR10+ video as Dolby Vision Profile 8.1 using metadata converted scene-by-scene from HDR10+ ST 2094-40 dynamic metadata. Takes effect on the next video."
++msgstr ""
+diff --git a/system/settings/settings.xml b/system/settings/settings.xml
+index 1111111..2222222 100755
+--- a/system/settings/settings.xml
++++ b/system/settings/settings.xml
+@@ -347,6 +347,12 @@
+           <default>true</default>
+           <control type="toggle" />
+         </setting>
++        <setting id="videoplayer.dolbyvisionfromhdr10plus" type="boolean" label="44420" help="44421">
++          <requirement>HAVE_PIDV</requirement>
++          <level>2</level>
++          <default>true</default>
++          <control type="toggle" />
++        </setting>
+         <setting id="videoplayer.dolbyvisionel" type="integer" label="36645" help="36659">
+           <requirement>HAVE_PIDV</requirement>
+           <level>1</level>
+diff --git a/xbmc/settings/Settings.h b/xbmc/settings/Settings.h
+index 1111111..2222222 100644
+--- a/xbmc/settings/Settings.h
++++ b/xbmc/settings/Settings.h
+@@ -164,6 +164,8 @@ public:
+       "videoplayer.dolbyvisionsdrgamma";
+   static constexpr auto SETTING_VIDEOPLAYER_DOLBYVISIONFROMHDRVIVID =
+       "videoplayer.dolbyvisionfromhdrvivid";
++  static constexpr auto SETTING_VIDEOPLAYER_DOLBYVISIONFROMHDR10PLUS =
++      "videoplayer.dolbyvisionfromhdr10plus";
+   static constexpr auto SETTING_VIDEOPLAYER_FILESTREAMDISPLAYORDER =
+       "videoplayer.filestreamdisplayorder";
+   static constexpr auto SETTING_VIDEOPLAYER_TELETEXTENABLED = "videoplayer.teletextenabled";
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/HDRVividDovi.h b/xbmc/cores/VideoPlayer/DVDDemuxers/HDRVividDovi.h
+index 1111111..2222222 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/HDRVividDovi.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/HDRVividDovi.h
+@@ -11,6 +11,7 @@
+ #include <stdint.h>
+ 
+ #include <libavutil/dovi_meta.h>
++#include <libavutil/hdr_dynamic_metadata.h>
+ #include <libavutil/hdr_dynamic_vivid_metadata.h>
+ #include <libavutil/mastering_display_metadata.h>
+ 
+@@ -28,7 +29,9 @@ bool hdrvivid_dovi_same_scene(const AVDynamicHDRVivid *a, const AVDynamicHDRVivi
+ 
+ struct hdrvivid_dovi_scene {
+   AVDynamicHDRVivid from;
+   bool have_from;
++  struct hdrvivid_dovi_l1 last_l1;
++  bool have_l1;
+   AVDOVIMetadata *first;
+   AVDOVIMetadata *made;
+   size_t size;
+@@ -44,6 +47,14 @@ const AVDOVIMetadata *hdrvivid_dovi_next(struct hdrvivid_dovi_scene *s,
+                                          const AVContentLightMetadata *light,
+                                          size_t *size, bool *repeated);
+ 
++bool hdr10plus_dovi_level1(const AVDynamicHDRPlus *metadata, struct hdrvivid_dovi_l1 *l1);
++
++const AVDOVIMetadata *hdr10plus_dovi_next(struct hdrvivid_dovi_scene *s,
++                                          const AVDynamicHDRPlus *hdrplus,
++                                          const AVMasteringDisplayMetadata *mastering,
++                                          const AVContentLightMetadata *light,
++                                          size_t *size, bool *repeated);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/HDRVividDovi.c b/xbmc/cores/VideoPlayer/DVDDemuxers/HDRVividDovi.c
+index 1111111..2222222 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/HDRVividDovi.c
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/HDRVividDovi.c
+@@ -299,3 +299,133 @@ const AVDOVIMetadata *hdrvivid_dovi_next(struct hdrvivid_dovi_scene *s,
+   *size = s->size;
+   return s->made;
+ }
++
++bool hdr10plus_dovi_level1(const AVDynamicHDRPlus *metadata, struct hdrvivid_dovi_l1 *l1)
++{
++  if (!metadata || !l1 || metadata->num_windows < 1)
++    return false;
++  const AVHDRPlusColorTransformParams *p = &metadata->params[0];
++
++  double peak = 0.0;
++  for (int i = 0; i < 3; ++i) {
++    if (p->maxscl[i].den > 0) {
++      const double v = av_q2d(p->maxscl[i]);
++      if (v > peak)
++        peak = v;
++    }
++  }
++  if (peak <= 0.0) {
++    for (int i = 0; i < p->num_distribution_maxrgb_percentiles && i < 15; ++i) {
++      if (p->distribution_maxrgb[i].percentile.den > 0) {
++        const double v = av_q2d(p->distribution_maxrgb[i].percentile);
++        if (v > peak)
++          peak = v;
++      }
++    }
++  }
++  if (!(peak > 0.0))
++    return false;
++
++  double avg = p->average_maxrgb.den > 0 ? av_q2d(p->average_maxrgb) : 0.0;
++  if (avg < 0.0)
++    avg = 0.0;
++  if (avg > peak)
++    avg = peak;
++
++  double min_lin = 0.0;
++  if (p->num_distribution_maxrgb_percentiles > 0 &&
++      p->distribution_maxrgb[0].percentage <= 1 &&
++      p->distribution_maxrgb[0].percentile.den > 0) {
++    const double v = av_q2d(p->distribution_maxrgb[0].percentile);
++    if (v > 0.0 && v <= avg)
++      min_lin = v;
++  }
++
++  l1->max_pq = code12(pq_from_linear(peak));
++  l1->avg_pq = code12(pq_from_linear(avg));
++  l1->min_pq = code12(pq_from_linear(min_lin));
++  if (l1->avg_pq > l1->max_pq)
++    l1->avg_pq = l1->max_pq;
++  if (l1->min_pq > l1->avg_pq)
++    l1->min_pq = l1->avg_pq;
++  l1->min_raw = l1->min_pq;
++  l1->max_raw = l1->max_pq;
++  l1->avg_raw = l1->avg_pq;
++  return true;
++}
++
++const AVDOVIMetadata *hdr10plus_dovi_next(struct hdrvivid_dovi_scene *s,
++                                          const AVDynamicHDRPlus *hdrplus,
++                                          const AVMasteringDisplayMetadata *mastering,
++                                          const AVContentLightMetadata *light,
++                                          size_t *size, bool *repeated)
++{
++  if (!s || !size || !repeated)
++    return NULL;
++  *repeated = false;
++
++  struct hdrvivid_dovi_l1 l1;
++  const bool has_l1 = hdrplus && hdr10plus_dovi_level1(hdrplus, &l1);
++  if (has_l1) {
++    if (s->made && s->have_l1 &&
++        s->last_l1.min_pq == l1.min_pq &&
++        s->last_l1.max_pq == l1.max_pq &&
++        s->last_l1.avg_pq == l1.avg_pq) {
++      *size = s->size;
++      return s->made;
++    }
++
++    AVMasteringDisplayMetadata default_mastering;
++    if (!mastering || !mastering->has_luminance) {
++      memset(&default_mastering, 0, sizeof(default_mastering));
++      default_mastering.has_luminance = 1;
++      default_mastering.max_luminance = (AVRational){4000, 1};
++      default_mastering.min_luminance = (AVRational){1, 10000};
++      mastering = &default_mastering;
++    }
++
++    size_t bytes = 0;
++    AVDOVIMetadata *first = make_profile81_metadata(l1.min_pq, l1.max_pq, l1.avg_pq,
++                                                    mastering, light, true, &bytes);
++    AVDOVIMetadata *made = first ? av_malloc(bytes) : NULL;
++    if (made) {
++      memcpy(made, first, bytes);
++      av_dovi_get_color(made)->scene_refresh_flag = 0;
++      av_free(s->first);
++      av_free(s->made);
++      s->first = first;
++      s->made = made;
++      s->size = bytes;
++      s->last_l1 = l1;
++      s->have_l1 = true;
++      *size = bytes;
++      return s->first;
++    }
++    av_free(first);
++  }
++
++  if (!s->made) {
++    AVMasteringDisplayMetadata default_mastering;
++    if (!mastering || !mastering->has_luminance) {
++      memset(&default_mastering, 0, sizeof(default_mastering));
++      default_mastering.has_luminance = 1;
++      default_mastering.max_luminance = (AVRational){4000, 1};
++      default_mastering.min_luminance = (AVRational){1, 10000};
++      mastering = &default_mastering;
++    }
++    size_t bytes = 0;
++    AVDOVIMetadata *fallback = make_profile81_metadata(0, 3079, 1000,
++                                                       mastering, light, true, &bytes);
++    if (!fallback)
++      return NULL;
++    s->made = fallback;
++    s->size = bytes;
++    s->have_l1 = false;
++    *repeated = true;
++    *size = bytes;
++    return s->made;
++  }
++  *repeated = true;
++  *size = s->size;
++  return s->made;
++}
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVHdrVivid.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVHdrVivid.h
+index 1111111..2222222 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVHdrVivid.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVHdrVivid.h
+@@ -26,6 +26,7 @@ public:
+     bool picture = false;
+     bool dolbyVision = false;
+     bool mastering = false;
++    bool hdr10Plus = false;
+     std::vector<uint8_t> t35;
+   };
+ 
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVHdrVivid.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVHdrVivid.cpp
+index 1111111..2222222 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVHdrVivid.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVHdrVivid.cpp
+@@ -33,6 +33,8 @@ void TakeUnit(const uint8_t* unit, size_t size, CDVHdrVivid::AccessUnit* au)
+     for (const CHevcSei& sei : messages)
+       if (sei.m_payloadType == 137)
+         au->mastering = true;
++    if (!au->hdr10Plus && CHevcSei::FindHdr10PlusSeiMessage(buf, messages))
++      au->hdr10Plus = true;
+     if (au->t35.empty())
+     {
+       if (const auto vivid = CHevcSei::FindHdrVividSeiMessage(buf, messages))
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemux.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemux.h
+index 1111111..2222222 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemux.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemux.h
+@@ -180,6 +180,7 @@ public:
+   StreamHdrType hdr_type = StreamHdrType::HDR_TYPE_NONE; // type of HDR for this stream (hdr10, etc)
+   AVDOVIDecoderConfigurationRecord dovi{};
+   bool doviFromHdrVivid{false};
++  bool doviFromHdr10Plus{false};
+   //! Dolby Vision profile 7 in two video tracks: the enhancement layer is a track of its own,
+   //! which the player decodes with a decoder of its own and pairs with this layer by
+   //! presentation time (Hades).
+diff --git a/xbmc/cores/VideoPlayer/DVDStreamInfo.h b/xbmc/cores/VideoPlayer/DVDStreamInfo.h
+index 1111111..2222222 100644
+--- a/xbmc/cores/VideoPlayer/DVDStreamInfo.h
++++ b/xbmc/cores/VideoPlayer/DVDStreamInfo.h
+@@ -81,6 +81,7 @@ public:
+   std::string stereo_mode; // stereoscopic 3d mode
+   AVDOVIDecoderConfigurationRecord dovi{};
+   bool doviFromHdrVivid{false};
++  bool doviFromHdr10Plus{false};
+   //! Dolby Vision profile 7 in two video tracks: the enhancement layer is a track of its own,
+   //! which the player decodes with a decoder of its own and pairs with this layer by
+   //! presentation time (Hades)
+diff --git a/xbmc/cores/VideoPlayer/DVDStreamInfo.cpp b/xbmc/cores/VideoPlayer/DVDStreamInfo.cpp
+index 1111111..2222222 100644
+--- a/xbmc/cores/VideoPlayer/DVDStreamInfo.cpp
++++ b/xbmc/cores/VideoPlayer/DVDStreamInfo.cpp
+@@ -70,6 +70,7 @@ void CDVDStreamInfo::Clear()
+   stereo_mode.clear();
+   dovi = {};
+   doviFromHdrVivid = false;
++  doviFromHdr10Plus = false;
+   doviEL = false;
+   doviELExtradata = {};
+ 
+@@ -163,6 +164,8 @@ bool CDVDStreamInfo::Equal(const CDVDStreamInfo& right, int compare) const
+     return false;
+   if (doviFromHdrVivid != right.doviFromHdrVivid)
+     return false;
++  if (doviFromHdr10Plus != right.doviFromHdr10Plus)
++    return false;
+ 
+   // AUDIO
+   if( channels      != right.channels
+@@ -245,6 +248,7 @@ void CDVDStreamInfo::Assign(const CDVDStreamInfo& right, bool withextradata)
+   stereo_mode = right.stereo_mode;
+   dovi = right.dovi;
+   doviFromHdrVivid = right.doviFromHdrVivid;
++  doviFromHdr10Plus = right.doviFromHdr10Plus;
+   doviEL = right.doviEL;
+   if (withextradata)
+     doviELExtradata = right.doviELExtradata;
+@@ -319,6 +323,7 @@ void CDVDStreamInfo::Assign(const CDemuxStream& right, bool withextradata)
+     stereo_mode = stream->stereo_mode;
+     dovi = stream->dovi;
+     doviFromHdrVivid = stream->doviFromHdrVivid;
++    doviFromHdr10Plus = stream->doviFromHdr10Plus;
+     doviEL = stream->doviEL;
+     doviELExtradata = stream->doviELExtradata;
+   }
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+index 1111111..2222222 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+@@ -211,13 +211,20 @@ protected:
+   std::map<int, unsigned int> m_dvProbed;
+   std::map<int, AVDOVIDecoderConfigurationRecord> m_dvPromoted;
+   std::map<int, bool> m_dvFromHdrVivid;
++  std::map<int, bool> m_dvFromHdr10Plus;
+   void ProbeDolbyVision(CDemuxStream* stream, int streamIdx, const uint8_t* data, int size);
+   bool ProbeHdrVivid(CDemuxStream* stream,
+                      int streamIdx,
+                      const uint8_t* data,
+                      int size,
+                      unsigned int& probed,
+                      unsigned int done);
++  bool ProbeHdr10Plus(CDemuxStream* stream,
++                      int streamIdx,
++                      const uint8_t* data,
++                      int size,
++                      unsigned int& probed,
++                      unsigned int done);
+   //! the stream is Dolby Vision from here on: VideoPlayer opens its codec again
+   void PromoteDolbyVision(CDemuxStream* stream, const AVDOVIDecoderConfigurationRecord& record,
+                           const AVCodecParameters* enhancement);
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+index 1111111..2222222 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+@@ -738,6 +738,7 @@ void CDVDDemuxFFmpeg::Dispose()
+   m_dvProbed.clear();
+   m_dvPromoted.clear();
+   m_dvFromHdrVivid.clear();
++  m_dvFromHdr10Plus.clear();
+   m_dvNotJoined.clear();
+ #endif
+ 
+@@ -1366,6 +1367,7 @@ void CDVDDemuxFFmpeg::ProbeDolbyVision(CDemuxStream* stream,
+   if (!probe.rpu)
+   {
+-    ProbeHdrVivid(stream, streamIdx, data, size, probed, PROBED_PACKETS);
++    if (!ProbeHdrVivid(stream, streamIdx, data, size, probed, PROBED_PACKETS))
++      ProbeHdr10Plus(stream, streamIdx, data, size, probed, PROBED_PACKETS);
+     return;
+   }
+   probed = PROBED_PACKETS;
+@@ -1438,6 +1440,51 @@ bool CDVDDemuxFFmpeg::ProbeHdrVivid(CDemuxStream* stream,
+   return true;
+ }
+ 
++bool CDVDDemuxFFmpeg::ProbeHdr10Plus(CDemuxStream* stream,
++                                     int streamIdx,
++                                     const uint8_t* data,
++                                     int size,
++                                     unsigned int& probed,
++                                     unsigned int done)
++{
++  if (m_dvFromHdr10Plus.count(streamIdx))
++    return true;
++  const auto settings = CServiceBroker::GetSettingsComponent()->GetSettings();
++  if (!settings || !settings->GetBool(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONFROMHDR10PLUS))
++    return false;
++
++  const AVStream* avStream = m_pFormatContext->streams[streamIdx];
++  auto* video = static_cast<CDemuxStreamVideo*>(stream);
++  bool isHdr10Plus = (video->hdr_type == StreamHdrType::HDR_TYPE_HDR10PLUS);
++  if (!isHdr10Plus)
++  {
++    const CDVHdrVivid::AccessUnit unit = CDVHdrVivid::Read(
++        data, static_cast<size_t>(size), CDVLayerMerge::LengthSize(avStream->codecpar));
++    if (unit.dolbyVision || !unit.hdr10Plus)
++      return false;
++    isHdr10Plus = true;
++  }
++  if (!avStream->codecpar || avStream->codecpar->color_trc != AVCOL_TRC_SMPTE2084 ||
++      avStream->codecpar->color_primaries != AVCOL_PRI_BT2020)
++    return false;
++
++  probed = done;
++  AVDOVIDecoderConfigurationRecord record{};
++  const AVRational rate =
++      av_guess_frame_rate(m_pFormatContext, const_cast<AVStream*>(avStream), nullptr);
++  if (!CDVHdrVivid::Record(avStream->codecpar, rate, record))
++    return true;
++
++  CLog::Log(LOGINFO,
++            "CDVDDemuxFFmpeg: stream {} is HDR10+ without Dolby Vision: promoting to Dolby Vision profile 8.1",
++            streamIdx);
++  m_dvPromoted[streamIdx] = record;
++  m_dvFromHdr10Plus[streamIdx] = true;
++  video->doviFromHdr10Plus = true;
++  PromoteDolbyVision(stream, record, nullptr);
++  return true;
++}
++
+ void CDVDDemuxFFmpeg::ReportDVLayers()
+ {
+   if (m_dvBaseIndex < 0)
+@@ -2500,6 +2547,7 @@ CDemuxStream* CDVDDemuxFFmpeg::AddStream(int streamIdx)
+           st->hdr_type = StreamHdrType::HDR_TYPE_DOLBYVISION;
+           st->dovi = promoted->second;
+           st->doviFromHdrVivid = m_dvFromHdrVivid.count(streamIdx) != 0;
++          st->doviFromHdr10Plus = m_dvFromHdr10Plus.count(streamIdx) != 0;
+         }
+         // (an unverified pair is no Dolby Vision stream until its packets show it: CheckDVLayers())
+         if (streamIdx == m_dvBaseIndex && m_dvVerified)
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
+index 1111111..2222222 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
+@@ -83,6 +83,8 @@ protected:
+   bool m_dvFromHdrVivid{false};
+   int m_dvLengthSize{0};
+   struct hdrvivid_dovi_scene* m_dvHdrVividScene{nullptr};
+   std::deque<std::pair<int64_t, std::vector<uint8_t>>> m_hdrVividT35Queue;
++  bool m_dvFromHdr10Plus{false};
++  struct hdrvivid_dovi_scene* m_dvHdr10PlusScene{nullptr};
+ #endif
+ };
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+index 1111111..2222222 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+@@ -36,6 +36,7 @@ extern "C"
+ #include <libavfilter/buffersink.h>
+ #include <libavfilter/buffersrc.h>
+ #include <libavutil/error.h>
++#include <libavutil/hdr_dynamic_metadata.h>
+ #include <libavutil/hdr_dynamic_vivid_metadata.h>
+ #include <libavutil/imgutils.h>
+ #include <libavutil/opt.h>
+@@ -115,6 +116,8 @@ void CDVDVideoCodecDRMPRIME::Dispose()
+   hdrvivid_dovi_scene_destroy(m_dvHdrVividScene);
+   m_dvHdrVividScene = nullptr;
+   m_hdrVividT35Queue.clear();
++  hdrvivid_dovi_scene_destroy(m_dvHdr10PlusScene);
++  m_dvHdr10PlusScene = nullptr;
+ #endif
+   avcodec_free_context(&m_pCodecContext);
+ }
+@@ -429,6 +432,14 @@ bool CDVDVideoCodecDRMPRIME::Open(CDVDStreamInfo& hints, CDVDCodecOptions& optio
+     m_dvHdrVividScene = hdrvivid_dovi_scene_create();
+     CLog::Log(LOGINFO, "CDVDVideoCodecDRMPRIME: converting HDR Vivid metadata to Dolby Vision profile 8.1");
+   }
++  m_dvFromHdr10Plus = hints.doviFromHdr10Plus && !m_dolbyVisionEL && !m_dvFromHdrVivid;
++  hdrvivid_dovi_scene_destroy(m_dvHdr10PlusScene);
++  m_dvHdr10PlusScene = nullptr;
++  if (m_dvFromHdr10Plus)
++  {
++    m_dvHdr10PlusScene = hdrvivid_dovi_scene_create();
++    CLog::Log(LOGINFO, "CDVDVideoCodecDRMPRIME: converting HDR10+ metadata to Dolby Vision profile 8.1");
++  }
+ #endif
+ 
+   UpdateProcessInfo(m_pCodecContext, m_pCodecContext->pix_fmt);
+@@ -580,5 +591,6 @@ void CDVDVideoCodecDRMPRIME::Reset()
+   hdrvivid_dovi_scene_reset(m_dvHdrVividScene);
+   m_hdrVividT35Queue.clear();
++  hdrvivid_dovi_scene_reset(m_dvHdr10PlusScene);
+ #endif
+ }
+ 
+@@ -805,6 +817,37 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecDRMPRIME::GetPicture(VideoPicture* pVideo
+         if (AVFrameSideData* doviSd = av_frame_new_side_data(m_pFrame, AV_FRAME_DATA_DOVI_METADATA, madeSize))
+           std::memcpy(doviSd->data, made, madeSize);
+       }
+     }
++    else if (m_dvFromHdr10Plus && m_dvHdr10PlusScene)
++    {
++      const AVFrameSideData* sdPlus =
++          av_frame_get_side_data(m_pFrame, AV_FRAME_DATA_DYNAMIC_HDR_PLUS);
++      const auto* hdrPlus =
++          (sdPlus && sdPlus->size >= sizeof(AVDynamicHDRPlus))
++              ? reinterpret_cast<const AVDynamicHDRPlus*>(sdPlus->data)
++              : nullptr;
++      const AVFrameSideData* sdMaster =
++          av_frame_get_side_data(m_pFrame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
++      const auto* mastering =
++          (sdMaster && sdMaster->size >= sizeof(AVMasteringDisplayMetadata))
++              ? reinterpret_cast<const AVMasteringDisplayMetadata*>(sdMaster->data)
++              : m_hints.masteringMetadata.get();
++      const AVFrameSideData* sdLight =
++          av_frame_get_side_data(m_pFrame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
++      const auto* light =
++          (sdLight && sdLight->size >= sizeof(AVContentLightMetadata))
++              ? reinterpret_cast<const AVContentLightMetadata*>(sdLight->data)
++              : m_hints.contentLightMetadata.get();
++      size_t madeSize = 0;
++      bool repeated = false;
++      const AVDOVIMetadata* made = hdr10plus_dovi_next(
++          m_dvHdr10PlusScene, hdrPlus, mastering, light, &madeSize, &repeated);
++      if (made && madeSize > 0)
++      {
++        av_frame_remove_side_data(m_pFrame, AV_FRAME_DATA_DOVI_METADATA);
++        if (AVFrameSideData* doviSd = av_frame_new_side_data(m_pFrame, AV_FRAME_DATA_DOVI_METADATA, madeSize))
++          std::memcpy(doviSd->data, made, madeSize);
++      }
++    }
+ #endif
+     CVideoBufferDRMPRIMEFFmpeg* buffer = m_hwVideoBufferPool->Get();

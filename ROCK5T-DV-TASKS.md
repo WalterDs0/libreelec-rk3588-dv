@@ -75,16 +75,16 @@
 
 ---
 
-## 任务 4：新增 HDR10+ 实时转杜比视界 Profile 8.1（中优先级）
+## 任务 4：新增 HDR10+ 实时转杜比视界 Profile 8.1（中优先级）— ✅ 已实现并编译验证（待 Rock 5T 实机验证）
 
 ### 背景与现状
 - 当前 FFmpeg/Kodi 已能解析 `AV_FRAME_DATA_DYNAMIC_HDR_PLUS`（`0011` 播放信息面板已可读出 `Target / MaxSCL / Average / Curve`），但主线 RK3588 HDMI/DRM 驱动无原生 HDR10+ VSIF 下发，播放 HDR10+ 片源时自动回退为静态 HDR10。
-- 可直接复用 `0020`（HDR Vivid → DV P8.1）的成熟架构，实时将逐帧 HDR10+ 动态元数据转为 Profile 8.1 RPU 喂给 `pi-dv-engine`。
+- 已复用 `0020`（HDR Vivid → DV P8.1）架构，新增 `0032-videoplayer-hdr10plus-to-dolby-vision.patch`，实时将逐帧 HDR10+ ST 2094-40 动态元数据转为 Profile 8.1 RPU 喂给 `pi-dv-engine`。
 
 ### 实施 Checklist
-- [ ] 实现 `AVDynamicHDRPlus`（`maxscl` / `average_maxrgb` / 场景峰值）→ DV Profile 8.1 RPU（L1 动态元数据）转换器
-- [ ] 在 `DVDVideoCodecDRMPRIME` / `DVDDemuxFFmpeg` 接入实时转换开关（`videoplayer.dolbyvisionfromhdr10plus`）并添加 Kodi 设置项
-- [ ] 验证开启后在 DV 电视上正确点亮杜比视界且亮度/暗部过渡优于静态 HDR10
+- [x] 实现 `AVDynamicHDRPlus`（`maxscl` / `average_maxrgb` / `distribution_maxrgb` 场景峰值）→ DV Profile 8.1 RPU（L1 动态元数据 + 场景切换检测 + seek 缺帧回退）转换器（`HDRVividDovi.c` `hdr10plus_dovi_next()`）
+- [x] 在 `DVDDemuxFFmpeg`（支持容器 `HDR_TYPE_HDR10PLUS` 与带内 HEVC ST 2094-40 SEI 探测）与 `DVDVideoCodecDRMPRIME` 接入实时转换开关（`videoplayer.dolbyvisionfromhdr10plus`）并添加 Kodi 设置项，已在 `192.168.1.180` 完成 `make image` 编译验证
+- [ ] Rock 5T 实机验证：开启后在 DV 电视上正确点亮杜比视界且亮度/暗部过渡优于静态 HDR10
 
 ---
 
