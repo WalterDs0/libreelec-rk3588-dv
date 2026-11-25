@@ -1,0 +1,785 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: momokind <momokind2002@gmail.com>
+Date: Wed, 25 Nov 2026 19:52:00 +0800
+Subject: [PATCH] [VideoPlayer] Add Dolby Vision to HDR10 / 10-bit SDR (WCG-SDR) dynamic tone-mapping output
+
+Drive pi-dv-engine's PI_OUT_HDR10 and PI_OUT_SDR (BT.709 / WCG-SDR BT.2020)
+modes from Kodi so Dolby Vision streams (Profile 5 IPTPQc2, Profile 7
+FEL/MEL, Profile 8.1, HDR Vivid -> DV) render cleanly on non-DV HDR10 TVs
+and SDR monitors/projectors using 10-bit XRGB2101010 scanout and per-frame
+RPU L1 BT.2390 EETF dynamic tone mapping.
+---
+ addons/resource.language.en_gb/resources/strings.po |  54 +++++-
+ system/settings/settings.xml                        |  92 ++++++++--
+ xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.cpp |  10 +-
+ xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp |  61 ++++++-
+ xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h   |  10 ++
+ xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp | 115 +++++++++++--
+ xbmc/cores/VideoSettings.cpp                        |   6 +
+ xbmc/cores/VideoSettings.h                          |  22 +++
+ xbmc/settings/MediaSettings.cpp                     |  12 ++
+ xbmc/settings/Settings.cpp                          |   3 +
+ xbmc/settings/Settings.h                            |   6 +
+ xbmc/video/dialogs/GUIDialogVideoSettings.cpp       |  49 ++++++
+ xbmc/windowing/gbm/WinSystemGbm.cpp                 |   8 +
+ xbmc/windowing/gbm/WinSystemGbm.h                   |   1 +
+ 14 files changed, 422 insertions(+), 27 deletions(-)
+
+diff --git a/addons/resource.language.en_gb/resources/strings.po b/addons/resource.language.en_gb/resources/strings.po
+index 1111111..2222222 100644
+--- a/addons/resource.language.en_gb/resources/strings.po
++++ b/addons/resource.language.en_gb/resources/strings.po
+@@ -23411,7 +23411,67 @@ msgctxt "#36681"
+ msgid "The display's peak luminance, 1 to 10000 nits, for the Auto rules of the CM v4.0 metadata. 0: not known, and the rules that need it add nothing."
+ msgstr ""
+ 
+-#empty strings from id 36682 to 36898
++#: system/settings/settings.xml
++msgctxt "#36682"
++msgid "Dolby Vision output mode"
++msgstr ""
++
++#: system/settings/settings.xml
++msgctxt "#36683"
++msgid "Dolby Vision (TV-led)"
++msgstr ""
++
++#: system/settings/settings.xml
++msgctxt "#36684"
++msgid "HDR10 (10-bit PQ)"
++msgstr ""
++
++#: system/settings/settings.xml
++msgctxt "#36685"
++msgid "10-bit SDR (BT.709)"
++msgstr ""
++
++#: system/settings/settings.xml
++msgctxt "#36686"
++msgid "10-bit WCG-SDR (BT.2020)"
++msgstr ""
++
++#: system/settings/settings.xml
++msgctxt "#36687"
++msgid "Target peak luminance (nits)"
++msgstr ""
++
++#: system/settings/settings.xml
++msgctxt "#36688"
++msgid "SDR transfer function"
++msgstr ""
++
++#: system/settings/settings.xml
++msgctxt "#36689"
++msgid "Gamma 2.2"
++msgstr ""
++
++#: system/settings/settings.xml
++msgctxt "#36690"
++msgid "Gamma 2.4 (BT.1886)"
++msgstr ""
++
++#: system/settings/settings.xml
++msgctxt "#36691"
++msgid "Select how Dolby Vision content is output. Auto uses native Dolby Vision on DV displays, HDR10 on HDR10-only displays, and 10-bit SDR with per-frame L1 dynamic tone mapping on SDR displays."
++msgstr ""
++
++#: system/settings/settings.xml
++msgctxt "#36692"
++msgid "Target display peak luminance in nits for HDR10/SDR BT.2390 dynamic tone mapping. 0 (Auto) passes PQ through unchanged for HDR10 and targets 203 nits for SDR."
++msgstr ""
++
++#: system/settings/settings.xml
++msgctxt "#36693"
++msgid "Electro-optical transfer function (gamma curve) used when tone-mapping Dolby Vision to 10-bit SDR or WCG-SDR."
++msgstr ""
++
++#empty strings from id 36694 to 36898
+ 
+ #. Description of setting with label #729 "Enable SSL"
+ #: system/settings/settings.xml
+diff --git a/system/settings/settings.xml b/system/settings/settings.xml
+index 1111111..2222222 100755
+--- a/system/settings/settings.xml
++++ b/system/settings/settings.xml
+@@ -300,26 +300,55 @@
+         </setting>
+       </group>
+       <group id="6" label="36643">
++        <setting id="videoplayer.dolbyvisionoutputmode" type="integer" label="36682" help="36691">
++          <requirement>HAVE_PIDV</requirement>
++          <level>1</level>
++          <default>0</default>
++          <constraints>
++            <options>
++              <option label="16316">0</option>
++              <option label="36683">1</option>
++              <option label="36684">2</option>
++              <option label="36685">3</option>
++              <option label="36686">4</option>
++            </options>
++          </constraints>
++          <control type="spinner" format="string" />
++        </setting>
++        <setting id="videoplayer.dolbyvisiontargetnits" type="integer" label="36687" help="36692">
++          <requirement>HAVE_PIDV</requirement>
++          <level>2</level>
++          <default>0</default>
++          <constraints>
++            <minimum>0</minimum>
++            <step>50</step>
++            <maximum>4000</maximum>
++          </constraints>
++          <control type="spinner" format="integer">
++            <formatlabel>36675</formatlabel>
++            <minimumlabel>16316</minimumlabel>
++          </control>
++        </setting>
++        <setting id="videoplayer.dolbyvisionsdrgamma" type="integer" label="36688" help="36693">
++          <requirement>HAVE_PIDV</requirement>
++          <level>2</level>
++          <default>0</default>
++          <constraints>
++            <options>
++              <option label="36689">0</option>
++              <option label="36690">1</option>
++            </options>
++          </constraints>
++          <control type="spinner" format="string" />
++        </setting>
+         <setting id="videoplayer.dolbyvisionfromhdrvivid" type="boolean" label="44418" help="44419">
+           <requirement>HAVE_PIDV</requirement>
+-          <dependencies>
+-            <dependency type="visible">
+-              <condition on="property" name="supportsdolbyvision" />
+-            </dependency>
+-            <dependency type="enable" setting="videoplayer.allowedhdrformats" operator="contains">0</dependency>
+-          </dependencies>
+           <level>2</level>
+           <default>true</default>
+           <control type="toggle" />
+         </setting>
+         <setting id="videoplayer.dolbyvisionel" type="integer" label="36645" help="36659">
+           <requirement>HAVE_PIDV</requirement>
+-          <dependencies>
+-            <dependency type="visible">
+-              <condition on="property" name="supportsdolbyvision" />
+-            </dependency>
+-            <dependency type="enable" setting="videoplayer.allowedhdrformats" operator="contains">0</dependency>
+-          </dependencies>
+           <level>1</level>
+           <default>0</default>
+           <constraints>
+@@ -347,12 +376,6 @@
+         </setting>
+         <setting id="videoplayer.dolbyvisionupscale" type="integer" label="36646" help="36661">
+           <requirement>HAVE_PIDV</requirement>
+-          <dependencies>
+-            <dependency type="visible">
+-              <condition on="property" name="supportsdolbyvision" />
+-            </dependency>
+-            <dependency type="enable" setting="videoplayer.allowedhdrformats" operator="contains">0</dependency>
+-          </dependencies>
+           <level>3</level>
+           <default>0</default>
+           <constraints>
+@@ -367,12 +390,6 @@
+         </setting>
+         <setting id="videoplayer.dolbyvisionmmr" type="integer" label="36648" help="36662">
+           <requirement>HAVE_PIDV</requirement>
+-          <dependencies>
+-            <dependency type="visible">
+-              <condition on="property" name="supportsdolbyvision" />
+-            </dependency>
+-            <dependency type="enable" setting="videoplayer.allowedhdrformats" operator="contains">0</dependency>
+-          </dependencies>
+           <level>3</level>
+           <default>3</default>
+           <constraints>
+@@ -387,12 +404,6 @@
+         </setting>
+         <setting id="videoplayer.dolbyvisionfilters" type="integer" label="36653" help="36663">
+           <requirement>HAVE_PIDV</requirement>
+-          <dependencies>
+-            <dependency type="visible">
+-              <condition on="property" name="supportsdolbyvision" />
+-            </dependency>
+-            <dependency type="enable" setting="videoplayer.allowedhdrformats" operator="contains">0</dependency>
+-          </dependencies>
+           <level>3</level>
+           <default>0</default>
+           <constraints>
+diff --git a/xbmc/cores/VideoSettings.h b/xbmc/cores/VideoSettings.h
+index 1111111..2222222 100644
+--- a/xbmc/cores/VideoSettings.h
++++ b/xbmc/cores/VideoSettings.h
+@@ -245,6 +245,23 @@ enum EDOLBYVISIONCM4
+   VS_DOLBYVISION_CM4_AUTO2 = 4, //!< by the scene's peak (L1)
+ };
+ 
++//! Output mode for pi-dv-engine (native DV tunnel, HDR10, or 10-bit SDR / WCG-SDR)
++enum EDOLBYVISIONOUTPUTMODE
++{
++  VS_DOLBYVISION_OUT_AUTO = 0,
++  VS_DOLBYVISION_OUT_DV = 1,
++  VS_DOLBYVISION_OUT_HDR10 = 2,
++  VS_DOLBYVISION_OUT_SDR = 3,
++  VS_DOLBYVISION_OUT_WCG_SDR = 4,
++};
++
++//! Target transfer function when tone-mapping Dolby Vision to 10-bit SDR / WCG-SDR
++enum EDOLBYVISIONSDRGAMMA
++{
++  VS_DOLBYVISION_GAMMA_22 = 0,
++  VS_DOLBYVISION_GAMMA_24 = 1,
++};
++
+ enum ViewMode
+ {
+   ViewModeNormal = 0,
+@@ -305,6 +322,9 @@ public:
+   int m_DolbyVisionCM4Headroom; //!< Auto 2: percent above the display's peak
+   bool m_DolbyVisionRemoveL2; //!< the stream's L2 trims left out
+   int m_DolbyVisionPeak; //!< the display's peak, nits; 0: not known
++  EDOLBYVISIONOUTPUTMODE m_DolbyVisionOutputMode;
++  int m_DolbyVisionTargetNits; //!< 0: auto (HDR10 passthrough / SDR 203 nits)
++  EDOLBYVISIONSDRGAMMA m_DolbyVisionSDRGamma;
+   std::optional<bool>
+       m_isDefaultVideoSettings; //!< true: default video settings, false: video specific
+ };
+diff --git a/xbmc/cores/VideoSettings.cpp b/xbmc/cores/VideoSettings.cpp
+index 1111111..2222222 100644
+--- a/xbmc/cores/VideoSettings.cpp
++++ b/xbmc/cores/VideoSettings.cpp
+@@ -54,6 +54,9 @@ CVideoSettings::CVideoSettings()
+   m_DolbyVisionCM4Headroom = 20;
+   m_DolbyVisionRemoveL2 = false;
+   m_DolbyVisionPeak = 0;
++  m_DolbyVisionOutputMode = VS_DOLBYVISION_OUT_AUTO;
++  m_DolbyVisionTargetNits = 0;
++  m_DolbyVisionSDRGamma = VS_DOLBYVISION_GAMMA_22;
+ }
+ 
+ bool CVideoSettings::operator!=(const CVideoSettings &right) const
+@@ -96,6 +99,9 @@ bool CVideoSettings::operator!=(const CVideoSettings &right) const
+   if (m_DolbyVisionCM4Headroom != right.m_DolbyVisionCM4Headroom) return true;
+   if (m_DolbyVisionRemoveL2 != right.m_DolbyVisionRemoveL2) return true;
+   if (m_DolbyVisionPeak != right.m_DolbyVisionPeak) return true;
++  if (m_DolbyVisionOutputMode != right.m_DolbyVisionOutputMode) return true;
++  if (m_DolbyVisionTargetNits != right.m_DolbyVisionTargetNits) return true;
++  if (m_DolbyVisionSDRGamma != right.m_DolbyVisionSDRGamma) return true;
+   return false;
+ }
+ 
+diff --git a/xbmc/settings/Settings.h b/xbmc/settings/Settings.h
+index 1111111..2222222 100644
+--- a/xbmc/settings/Settings.h
++++ b/xbmc/settings/Settings.h
+@@ -156,6 +156,12 @@ public:
+   static constexpr auto SETTING_VIDEOPLAYER_DOLBYVISIONREMOVEL2 =
+       "videoplayer.dolbyvisionremovel2";
+   static constexpr auto SETTING_VIDEOPLAYER_DOLBYVISIONPEAK = "videoplayer.dolbyvisionpeak";
++  static constexpr auto SETTING_VIDEOPLAYER_DOLBYVISIONOUTPUTMODE =
++      "videoplayer.dolbyvisionoutputmode";
++  static constexpr auto SETTING_VIDEOPLAYER_DOLBYVISIONTARGETNITS =
++      "videoplayer.dolbyvisiontargetnits";
++  static constexpr auto SETTING_VIDEOPLAYER_DOLBYVISIONSDRGAMMA =
++      "videoplayer.dolbyvisionsdrgamma";
+   static constexpr auto SETTING_VIDEOPLAYER_DOLBYVISIONFROMHDRVIVID =
+       "videoplayer.dolbyvisionfromhdrvivid";
+   static constexpr auto SETTING_VIDEOPLAYER_FILESTREAMDISPLAYORDER =
+diff --git a/xbmc/settings/Settings.cpp b/xbmc/settings/Settings.cpp
+index 1111111..2222222 100644
+--- a/xbmc/settings/Settings.cpp
++++ b/xbmc/settings/Settings.cpp
+@@ -602,5 +602,8 @@ void CSettings::InitializeISettingCallbacks()
+        CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONCM4HEADROOM,
+        CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONREMOVEL2,
+-       CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONPEAK});
++       CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONPEAK,
++       CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONOUTPUTMODE,
++       CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONTARGETNITS,
++       CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONSDRGAMMA});
+ 
+   GetSettingsManager()->RegisterCallback(
+diff --git a/xbmc/settings/MediaSettings.cpp b/xbmc/settings/MediaSettings.cpp
+index 1111111..2222222 100644
+--- a/xbmc/settings/MediaSettings.cpp
++++ b/xbmc/settings/MediaSettings.cpp
+@@ -420,6 +420,12 @@ void CMediaSettings::GetDolbyVisionSettings(CVideoSettings& settings)
+   settings.m_DolbyVisionRemoveL2 =
+       s->GetBool(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONREMOVEL2);
+   settings.m_DolbyVisionPeak = s->GetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONPEAK);
++  settings.m_DolbyVisionOutputMode = static_cast<EDOLBYVISIONOUTPUTMODE>(
++      s->GetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONOUTPUTMODE));
++  settings.m_DolbyVisionTargetNits =
++      s->GetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONTARGETNITS);
++  settings.m_DolbyVisionSDRGamma = static_cast<EDOLBYVISIONSDRGAMMA>(
++      s->GetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONSDRGAMMA));
+ #endif
+ }
+ 
+@@ -440,6 +446,12 @@ void CMediaSettings::SetDolbyVisionSettings(const CVideoSettings& settings)
+             settings.m_DolbyVisionCM4Headroom);
+   s->SetBool(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONREMOVEL2, settings.m_DolbyVisionRemoveL2);
+   s->SetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONPEAK, settings.m_DolbyVisionPeak);
++  s->SetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONOUTPUTMODE,
++            settings.m_DolbyVisionOutputMode);
++  s->SetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONTARGETNITS,
++            settings.m_DolbyVisionTargetNits);
++  s->SetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONSDRGAMMA,
++            settings.m_DolbyVisionSDRGamma);
+ #endif
+ }
+ 
+diff --git a/xbmc/video/dialogs/GUIDialogVideoSettings.cpp b/xbmc/video/dialogs/GUIDialogVideoSettings.cpp
+index 1111111..2222222 100644
+--- a/xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++++ b/xbmc/video/dialogs/GUIDialogVideoSettings.cpp
+@@ -70,6 +70,9 @@
+ #define SETTING_VIDEO_DOLBYVISION_CM4_HEADROOM "video.dolbyvision.cm4headroom"
+ #define SETTING_VIDEO_DOLBYVISION_PEAK    "video.dolbyvision.peak"
+ #define SETTING_VIDEO_DOLBYVISION_REMOVE_L2 "video.dolbyvision.removel2"
++#define SETTING_VIDEO_DOLBYVISION_OUTPUT_MODE "video.dolbyvision.outputmode"
++#define SETTING_VIDEO_DOLBYVISION_TARGET_NITS "video.dolbyvision.targetnits"
++#define SETTING_VIDEO_DOLBYVISION_SDR_GAMMA "video.dolbyvision.sdrgamma"
+ 
+ #define SETTING_VIDEO_STEREOSCOPICMODE    "video.stereoscopicmode"
+ #define SETTING_VIDEO_STEREOSCOPICINVERT  "video.stereoscopicinvert"
+@@ -222,7 +225,10 @@ void CGUIDialogVideoSettings::OnSettingChanged(const std::shared_ptr<const CSett
+            settingId == SETTING_VIDEO_DOLBYVISION_CM4 ||
+            settingId == SETTING_VIDEO_DOLBYVISION_CM4_TRIGGER ||
+            settingId == SETTING_VIDEO_DOLBYVISION_CM4_HEADROOM ||
+-           settingId == SETTING_VIDEO_DOLBYVISION_PEAK)
++           settingId == SETTING_VIDEO_DOLBYVISION_PEAK ||
++           settingId == SETTING_VIDEO_DOLBYVISION_OUTPUT_MODE ||
++           settingId == SETTING_VIDEO_DOLBYVISION_TARGET_NITS ||
++           settingId == SETTING_VIDEO_DOLBYVISION_SDR_GAMMA)
+   {
+     CVideoSettings vs = appPlayer->GetVideoSettings();
+     const int value = std::static_pointer_cast<const CSettingInt>(setting)->GetValue();
+@@ -242,6 +248,12 @@ void CGUIDialogVideoSettings::OnSettingChanged(const std::shared_ptr<const CSett
+       vs.m_DolbyVisionCM4Headroom = value;
+     else if (settingId == SETTING_VIDEO_DOLBYVISION_PEAK)
+       vs.m_DolbyVisionPeak = value;
++    else if (settingId == SETTING_VIDEO_DOLBYVISION_OUTPUT_MODE)
++      vs.m_DolbyVisionOutputMode = static_cast<EDOLBYVISIONOUTPUTMODE>(value);
++    else if (settingId == SETTING_VIDEO_DOLBYVISION_TARGET_NITS)
++      vs.m_DolbyVisionTargetNits = value;
++    else if (settingId == SETTING_VIDEO_DOLBYVISION_SDR_GAMMA)
++      vs.m_DolbyVisionSDRGamma = static_cast<EDOLBYVISIONSDRGAMMA>(value);
+     else
+       vs.m_DolbyVisionInfoframe = static_cast<EDOLBYVISIONINFOFRAME>(value);
+     appPlayer->SetVideoSettings(vs);
+@@ -534,6 +546,28 @@ void CGUIDialogVideoSettings::InitializeSettings()
+     AddToggle(groupDolbyVision, SETTING_VIDEO_DOLBYVISION, 36644, SettingLevel::Basic,
+               videoSettings.m_DolbyVision);
+ 
++    entries.clear();
++    entries.emplace_back(16316, VS_DOLBYVISION_OUT_AUTO);
++    entries.emplace_back(36683, VS_DOLBYVISION_OUT_DV);
++    entries.emplace_back(36684, VS_DOLBYVISION_OUT_HDR10);
++    entries.emplace_back(36685, VS_DOLBYVISION_OUT_SDR);
++    entries.emplace_back(36686, VS_DOLBYVISION_OUT_WCG_SDR);
++    AddSpinner(groupDolbyVision, SETTING_VIDEO_DOLBYVISION_OUTPUT_MODE, 36682, SettingLevel::Basic,
++               videoSettings.m_DolbyVisionOutputMode, entries);
++
++    {
++      auto peak = AddSpinner(groupDolbyVision, SETTING_VIDEO_DOLBYVISION_TARGET_NITS, 36687,
++                             SettingLevel::Standard, videoSettings.m_DolbyVisionTargetNits, 0, 50,
++                             4000, 36675);
++      std::static_pointer_cast<CSettingControlSpinner>(peak->GetControl())->SetMinimumLabel(16316);
++    }
++
++    entries.clear();
++    entries.emplace_back(36689, VS_DOLBYVISION_GAMMA_22);
++    entries.emplace_back(36690, VS_DOLBYVISION_GAMMA_24);
++    AddSpinner(groupDolbyVision, SETTING_VIDEO_DOLBYVISION_SDR_GAMMA, 36688, SettingLevel::Standard,
++               videoSettings.m_DolbyVisionSDRGamma, entries);
++
+     entries.clear();
+     entries.emplace_back(16316, VS_DOLBYVISION_EL_AUTO);
+     entries.emplace_back(16039, VS_DOLBYVISION_EL_OFF);
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.h b/xbmc/windowing/gbm/WinSystemGbm.h
+index 1111111..2222222 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.h
++++ b/xbmc/windowing/gbm/WinSystemGbm.h
+@@ -124,6 +124,7 @@ private:
+   KODI::UTILS::Colorimetry m_colorimetry = KODI::UTILS::Colorimetry::DEFAULT;
+   DolbyVisionOutput m_dolbyVision = DolbyVisionOutput::OFF;
+   std::optional<uint64_t> m_dolbyVisionSavedBroadcastRGB;
++  std::optional<uint64_t> m_dolbyVisionSavedMaxBpc;
+ 
+   std::unique_ptr<UTILS::CDisplayInfo> m_info;
+ };
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
+index 1111111..2222222 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -692,9 +692,11 @@ bool CWinSystemGbm::SetDolbyVision(DolbyVisionOutput output)
+     // Kodi doesn't set it otherwise: the first value seen is the one to restore
+     if (!m_dolbyVisionSavedBroadcastRGB)
+       m_dolbyVisionSavedBroadcastRGB = connector->GetPropertyValue("Broadcast RGB");
++    if (!m_dolbyVisionSavedMaxBpc && connector->SupportsProperty("max bpc"))
++      m_dolbyVisionSavedMaxBpc = connector->GetPropertyValue("max bpc");
+     const std::optional<uint64_t> full = connector->GetPropertyEnumValue("Broadcast RGB", "Full");
+     if (full)
+       drm->AddProperty(connector, "Broadcast RGB", full.value());
+     drm->AddProperty(connector, "max bpc", 8);
+ 
+     if (connector->SupportsProperty("HDR_OUTPUT_METADATA"))
+@@ -714,6 +716,12 @@ bool CWinSystemGbm::SetDolbyVision(DolbyVisionOutput output)
+   else if (m_dolbyVisionSavedBroadcastRGB)
+   {
+     drm->AddProperty(connector, "Broadcast RGB", m_dolbyVisionSavedBroadcastRGB.value());
++    if (m_dolbyVisionSavedMaxBpc && connector->SupportsProperty("max bpc"))
++      drm->AddProperty(connector, "max bpc", m_dolbyVisionSavedMaxBpc.value());
++  }
++  else if (m_dolbyVisionSavedMaxBpc && connector->SupportsProperty("max bpc"))
++  {
++    drm->AddProperty(connector, "max bpc", m_dolbyVisionSavedMaxBpc.value());
+   }
+ 
+   CLog::LogF(LOGDEBUG, "setting connector Dolby Vision to {}", name);
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.cpp
+index 1111111..2222222 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.cpp
+@@ -68,12 +68,16 @@ std::unique_ptr<CDVELDecoderDRMPRIME> CDVELDecoderDRMPRIME::Create(
+       separate ? hints.doviELExtradata.GetSize() : hints.extradata.GetSize();
+   const bool hvcc = extradata && extradataSize >= 23 && extradata[0] == 1;
+ 
++  const auto settings = CServiceBroker::GetSettingsComponent()->GetSettings();
+   const auto allowedHdrFormats = std::dynamic_pointer_cast<CSettingList>(
+-      CServiceBroker::GetSettingsComponent()->GetSettings()->GetSetting(
+-          CSettings::SETTING_VIDEOPLAYER_ALLOWEDHDRFORMATS));
+-  if (!CSettingUtils::FindIntInList(allowedHdrFormats,
+-                                    CSettings::VIDEOPLAYER_ALLOWED_HDR_TYPE_DOLBY_VISION) ||
+-      !CServiceBroker::GetWinSystem()->GetDisplayHDRCapabilities().SupportsDolbyVision())
++      settings->GetSetting(CSettings::SETTING_VIDEOPLAYER_ALLOWEDHDRFORMATS));
++  const int outMode = settings->GetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONOUTPUTMODE);
++  const bool dvDisplay =
++      CServiceBroker::GetWinSystem()->GetDisplayHDRCapabilities().SupportsDolbyVision();
++  const bool allowNativeDv =
++      dvDisplay && CSettingUtils::FindIntInList(
++                       allowedHdrFormats, CSettings::VIDEOPLAYER_ALLOWED_HDR_TYPE_DOLBY_VISION);
++  if (!allowNativeDv && outMode == VS_DOLBYVISION_OUT_DV)
+     return nullptr;
+ 
+   std::unique_ptr<CDVELDecoderDRMPRIME> el(new CDVELDecoderDRMPRIME());
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
+index 1111111..2222222 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
+@@ -52,6 +52,10 @@ public:
+     pi_mmr_mode mmr = PI_MMR_FLOAT;
+     pi_filters filters = PI_FILTERS_CB1;
+     pi_el_upscale elUpscale = PI_EL_BILINEAR;
++    pi_output_mode outputMode = PI_OUT_DV_STANDARD;
++    unsigned int targetNits = 0;
++    pi_sdr_gamut sdrGamut = PI_GAMUT_BT709;
++    pi_sdr_gamma sdrGamma = PI_GAMMA_22;
+     //! render the enhancement layer where the RPU needs it (FEL); false: the base layer alone
+     bool enhancementLayer = true;
+     Metadata metadata;
+@@ -72,6 +76,7 @@ public:
+    */
+   void Flush();
+   const Options& GetOptions() const { return m_options; }
++  bool IsTunnelOutput() const { return m_options.outputMode == PI_OUT_DV_STANDARD; }
+ 
+   //! \brief The stream's size
+   unsigned int GetWidth() const { return m_info.width; }
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
+index 1111111..2222222 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
+@@ -137,19 +137,20 @@ int AllocateDmaBuf(uint64_t size)
+ }
+ } // namespace
+ 
+-//! \brief A tunnel frame: an XRGB8888 linear dma-buf the engine renders into
++//! \brief An output frame: linear XRGB8888 (DV tunnel) or XRGB2101010 (HDR10/SDR) dma-buf
+ class CDVTunnelOutput : public CVideoBufferDRMPRIME
+ {
+ public:
+-  CDVTunnelOutput(int id, int fd, uint32_t width, uint32_t height, uint32_t stride, uint64_t size)
++  CDVTunnelOutput(int id, int fd, uint32_t width, uint32_t height, uint32_t stride, uint64_t size,
++                  uint32_t drmFormat, uint8_t colorBits)
+     : CVideoBufferDRMPRIME(id), m_fd(fd), m_size(size), m_stride(stride)
+   {
+     m_descriptor.nb_objects = 1;
+     m_descriptor.objects[0].fd = fd;
+     m_descriptor.objects[0].size = size;
+     m_descriptor.objects[0].format_modifier = DRM_FORMAT_MOD_LINEAR;
+     m_descriptor.nb_layers = 1;
+-    m_descriptor.layers[0].format = DRM_FORMAT_XRGB8888;
++    m_descriptor.layers[0].format = drmFormat;
+     m_descriptor.layers[0].nb_planes = 1;
+     m_descriptor.layers[0].planes[0].object_index = 0;
+     m_descriptor.layers[0].planes[0].offset = 0;
+@@ -158,7 +159,7 @@ public:
+     picture.iWidth = picture.iDisplayWidth = width;
+     picture.iHeight = picture.iDisplayHeight = height;
+     picture.color_range = 1;
+-    picture.colorBits = 8;
++    picture.colorBits = colorBits;
+     SetPictureParams(picture);
+   }
+ 
+@@ -274,6 +275,10 @@ std::unique_ptr<CDVTunnelDRMPRIME> CDVTunnelDRMPRIME::Create(const VideoPicture&
+   o.mmr = options.mmr;
+   o.filters = options.filters;
+   o.el_upscale = options.elUpscale;
++  o.output_mode = options.outputMode;
++  o.target_nits = options.targetNits;
++  o.sdr_gamut = options.sdrGamut;
++  o.sdr_gamma = options.sdrGamma;
+   o.pipeline_cache = tunnel->m_pipelineCache.c_str();
+   o.log = Log;
+   o.log_level = PI_LOG_INFO;
+@@ -312,6 +317,9 @@ std::unique_ptr<CDVTunnelDRMPRIME> CDVTunnelDRMPRIME::Create(const VideoPicture&
+   bytes = (bytes + 4095) & ~static_cast<uint64_t>(4095);
+ 
+   tunnel->m_pool = std::make_shared<CDVTunnelOutputPool>();
++  const uint32_t drmFormat =
++      options.outputMode == PI_OUT_DV_STANDARD ? DRM_FORMAT_XRGB8888 : DRM_FORMAT_XRGB2101010;
++  const uint8_t colorBits = options.outputMode == PI_OUT_DV_STANDARD ? 8 : 10;
+   for (int i = 0; i < OUTPUTS; i++)
+   {
+     int fd = AllocateDmaBuf(bytes);
+@@ -321,7 +329,8 @@ std::unique_ptr<CDVTunnelDRMPRIME> CDVTunnelDRMPRIME::Create(const VideoPicture&
+       return nullptr;
+     }
+ 
+-    auto output = std::make_unique<CDVTunnelOutput>(i, fd, width, height, stride, bytes);
++    auto output =
++        std::make_unique<CDVTunnelOutput>(i, fd, width, height, stride, bytes, drmFormat, colorBits);
+     ret = pi_output_import(tunnel->m_engine, fd, width, height, stride, bytes, &output->m_output);
+     if (ret != PI_OK)
+     {
+@@ -608,6 +617,10 @@ bool CDVTunnelDRMPRIME::SetOptions(const Options& options)
+   o.mmr = options.mmr;
+   o.filters = options.filters;
+   o.el_upscale = options.elUpscale;
++  o.output_mode = options.outputMode;
++  o.target_nits = options.targetNits;
++  o.sdr_gamut = options.sdrGamut;
++  o.sdr_gamma = options.sdrGamma;
+ 
+   int ret = pi_engine_configure(m_engine, &o);
+   if (ret == PI_OK)
+@@ -762,7 +775,18 @@ void CDVTunnelDRMPRIME::Describe(DRMPRIME::PlayerInfo& info, float fps) const
+   info["Info.ChromaMapping"] =
+       m_mmr ? StringUtils::Format("MMR · {}", MMRName(m_options.mmr)) : "Polynomial";
+   info["Info.Filters"] = m_options.filters == PI_FILTERS_PHASE ? "Phase" : "CB1";
+-  info["Info.Link"] = "RGB 8-bit tunnel";
++  if (m_options.outputMode == PI_OUT_HDR10)
++    info["Info.Link"] = m_options.targetNits > 0
++                            ? StringUtils::Format("HDR10 10-bit PQ ({} nits)", m_options.targetNits)
++                            : "HDR10 10-bit PQ";
++  else if (m_options.outputMode == PI_OUT_SDR)
++    info["Info.Link"] = StringUtils::Format(
++        "10-bit {} ({} nits, {})",
++        m_options.sdrGamut == PI_GAMUT_BT2020 ? "WCG-SDR BT.2020" : "SDR BT.709",
++        m_options.targetNits > 0 ? m_options.targetNits : 203u,
++        m_options.sdrGamma == PI_GAMMA_24 ? "Gamma 2.4" : "Gamma 2.2");
++  else
++    info["Info.Link"] = "RGB 8-bit tunnel";
+ 
+   // what Options::Metadata made of the stream's, where they ask for anything
+   std::string metadata;
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
+index 1111111..2222222 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
+@@ -211,7 +211,50 @@ std::vector<CRect> GroupRows(std::vector<CRect> regions, size_t max)
+ 
+ CDVTunnelDRMPRIME::Options GetDolbyVisionOptions(const CVideoSettings& settings)
+ {
++  auto* winSystem = static_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem());
++  const auto allowedHdrFormats = std::dynamic_pointer_cast<CSettingList>(
++      CServiceBroker::GetSettingsComponent()->GetSettings()->GetSetting(
++          CSettings::SETTING_VIDEOPLAYER_ALLOWEDHDRFORMATS));
++  const bool dvAllowed =
++      winSystem && winSystem->GetDisplayHDRCapabilities().SupportsDolbyVision() &&
++      CSettingUtils::FindIntInList(allowedHdrFormats,
++                                   CSettings::VIDEOPLAYER_ALLOWED_HDR_TYPE_DOLBY_VISION);
++  const bool hdrDisplay = winSystem && winSystem->IsHDRDisplay();
++
+   CDVTunnelDRMPRIME::Options options;
++  switch (settings.m_DolbyVisionOutputMode)
++  {
++    case VS_DOLBYVISION_OUT_DV:
++      options.outputMode = PI_OUT_DV_STANDARD;
++      break;
++    case VS_DOLBYVISION_OUT_HDR10:
++      options.outputMode = PI_OUT_HDR10;
++      break;
++    case VS_DOLBYVISION_OUT_SDR:
++      options.outputMode = PI_OUT_SDR;
++      options.sdrGamut = PI_GAMUT_BT709;
++      break;
++    case VS_DOLBYVISION_OUT_WCG_SDR:
++      options.outputMode = PI_OUT_SDR;
++      options.sdrGamut = PI_GAMUT_BT2020;
++      break;
++    case VS_DOLBYVISION_OUT_AUTO:
++    default:
++      if (dvAllowed)
++        options.outputMode = PI_OUT_DV_STANDARD;
++      else if (hdrDisplay)
++        options.outputMode = PI_OUT_HDR10;
++      else
++      {
++        options.outputMode = PI_OUT_SDR;
++        options.sdrGamut = PI_GAMUT_BT709;
++      }
++      break;
++  }
++  options.targetNits =
++      static_cast<unsigned int>(std::clamp(settings.m_DolbyVisionTargetNits, 0, 10000));
++  options.sdrGamma = settings.m_DolbyVisionSDRGamma == VS_DOLBYVISION_GAMMA_24 ? PI_GAMMA_24
++                                                                               : PI_GAMMA_22;
+   switch (settings.m_DolbyVisionMMR)
+   {
+     case VS_DOLBYVISION_MMR_SPLIT:
+@@ -276,38 +319,74 @@ DolbyVisionOutput GetDolbyVisionInfoframe(const CVideoSettings& settings)
+ bool CRendererDRMPRIME::SetDolbyVisionOutput(const VideoPicture& picture)
+ {
+ #if defined(HAVE_PIDV)
++  auto* winSystem = static_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem());
++  const CDVTunnelDRMPRIME::Options options = GetDolbyVisionOptions(m_videoSettings);
+   if (!m_dolbyVisionCapable)
+   {
+-    auto* winSystem = static_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem());
+     const auto allowedHdrFormats = std::dynamic_pointer_cast<CSettingList>(
+         CServiceBroker::GetSettingsComponent()->GetSettings()->GetSetting(
+             CSettings::SETTING_VIDEOPLAYER_ALLOWEDHDRFORMATS));
+-    m_dolbyVisionCapable =
+-        CDVTunnelDRMPRIME::Supports(picture) &&
++    const bool nativeDvOk =
+         CSettingUtils::FindIntInList(allowedHdrFormats,
+                                      CSettings::VIDEOPLAYER_ALLOWED_HDR_TYPE_DOLBY_VISION) &&
+         winSystem->GetDisplayHDRCapabilities().SupportsDolbyVision();
++    m_dolbyVisionCapable =
++        CDVTunnelDRMPRIME::Supports(picture) &&
++        (options.outputMode != PI_OUT_DV_STANDARD || nativeDvOk);
+   }
+ 
+   m_dolbyVisionEnabled = m_videoSettings.m_DolbyVision;
+   if (!m_dolbyVisionCapable || !m_dolbyVisionEnabled)
+     return false;
+ 
+-  m_dolbyVision = CDVTunnelDRMPRIME::Create(picture, GetDolbyVisionOptions(m_videoSettings));
++  if (options.outputMode == PI_OUT_DV_STANDARD &&
++      !winSystem->GetDisplayHDRCapabilities().SupportsDolbyVision())
++    return false;
++
++  m_dolbyVision = CDVTunnelDRMPRIME::Create(picture, options);
+   if (!m_dolbyVision)
+     return false;
+ 
+-  auto* winSystem = static_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem());
+-  if (!winSystem->SetDolbyVision(GetDolbyVisionInfoframe(m_videoSettings)))
++  if (options.outputMode == PI_OUT_DV_STANDARD)
+   {
+-    m_dolbyVision.reset();
+-    return false;
++    if (!winSystem->SetDolbyVision(GetDolbyVisionInfoframe(m_videoSettings)))
++    {
++      m_dolbyVision.reset();
++      return false;
++    }
++    winSystem->SetHDR(nullptr);
++  }
++  else if (options.outputMode == PI_OUT_HDR10)
++  {
++    winSystem->SetDolbyVision(DolbyVisionOutput::OFF);
++    VideoPicture hdrPic;
++    hdrPic.Reset();
++    hdrPic.SetParams(picture);
++    hdrPic.color_transfer = AVCOL_TRC_SMPTE2084;
++    hdrPic.color_primaries = AVCOL_PRI_BT2020;
++    hdrPic.color_space = AVCOL_SPC_BT2020_NCL;
++    winSystem->SetColorimetry(&hdrPic);
++    m_hdrOutput = winSystem->SetHDR(&hdrPic);
++  }
++  else
++  {
++    winSystem->SetDolbyVision(DolbyVisionOutput::OFF);
++    VideoPicture sdrPic;
++    sdrPic.Reset();
++    sdrPic.SetParams(picture);
++    sdrPic.color_transfer = AVCOL_TRC_BT709;
++    sdrPic.color_primaries =
++        options.sdrGamut == PI_GAMUT_BT2020 ? AVCOL_PRI_BT2020 : AVCOL_PRI_BT709;
++    sdrPic.color_space =
++        options.sdrGamut == PI_GAMUT_BT2020 ? AVCOL_SPC_BT2020_NCL : AVCOL_SPC_BT709;
++    winSystem->SetColorimetry(&sdrPic);
++    winSystem->SetHDR(nullptr);
++    m_hdrOutput = false;
+   }
+ 
+   m_dolbyVisionMismatches = 0;
+   winSystem->SetGuiCompositing(false);
+   SetGuiCapture(true);
+-  winSystem->SetHDR(nullptr);
+   // the bridge configures the plane and connector for the tunnel's frames
+   m_iLastRenderBuffer = -1;
+   return true;
+@@ -351,9 +430,22 @@ void CRendererDRMPRIME::UpdateDolbyVisionOutput(const VideoPicture& picture)
+   if (!m_dolbyVision)
+     return;
+ 
+-  m_dolbyVision->SetOptions(GetDolbyVisionOptions(m_videoSettings));
+-  static_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem())
+-      ->SetDolbyVision(GetDolbyVisionInfoframe(m_videoSettings));
++  const CDVTunnelDRMPRIME::Options options = GetDolbyVisionOptions(m_videoSettings);
++  const CDVTunnelDRMPRIME::Options& current = m_dolbyVision->GetOptions();
++  if (options.outputMode != current.outputMode ||
++      (options.outputMode == PI_OUT_SDR && options.sdrGamut != current.sdrGamut))
++  {
++    SetGuiCapture(false);
++    m_dolbyVision.reset();
++    if (!SetDolbyVisionOutput(picture))
++      SetHDROutput(picture);
++    return;
++  }
++
++  m_dolbyVision->SetOptions(options);
++  if (options.outputMode == PI_OUT_DV_STANDARD)
++    static_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem())
++        ->SetDolbyVision(GetDolbyVisionInfoframe(m_videoSettings));
+ #endif
+ }
+ 
+@@ -364,10 +456,12 @@ bool CRendererDRMPRIME::RenderDolbyVision(CVideoBufferDRMPRIME* buffer)
+   if (!m_dolbyVision)
+     return false;
+ 
+-  // the tunnel frame is only decoded 1:1, in a mode of its size
++  // the tunnel frame is only decoded 1:1, in a mode of its size; non-tunnel
++  // HDR10/SDR RGB frames can be scaled by VOP2 to any display mode
+   const RESOLUTION_INFO& info = CServiceBroker::GetWinSystem()->GetGfxContext().GetResInfo();
+-  if (static_cast<unsigned int>(info.iScreenWidth) != m_dolbyVision->GetOutputWidth() ||
+-      static_cast<unsigned int>(info.iScreenHeight) != m_dolbyVision->GetOutputHeight())
++  if (m_dolbyVision->IsTunnelOutput() &&
++      (static_cast<unsigned int>(info.iScreenWidth) != m_dolbyVision->GetOutputWidth() ||
++       static_cast<unsigned int>(info.iScreenHeight) != m_dolbyVision->GetOutputHeight()))
+   {
+     // a refresh rate switch may still be pending
+     if (++m_dolbyVisionMismatches < 100)
+@@ -391,8 +485,10 @@ bool CRendererDRMPRIME::RenderDolbyVision(CVideoBufferDRMPRIME* buffer)
+   if (m_iLastRenderBuffer == -1)
+     m_videoLayerBridge->Configure(output);
+ 
+-  m_videoLayerBridge->SetVideoPlane(
+-      output, CRect(0, 0, m_dolbyVision->GetOutputWidth(), m_dolbyVision->GetOutputHeight()), fence);
++  const CRect dest = m_dolbyVision->IsTunnelOutput()
++                         ? CRect(0, 0, m_dolbyVision->GetOutputWidth(), m_dolbyVision->GetOutputHeight())
++                         : CRect(0, 0, info.iScreenWidth, info.iScreenHeight);
++  m_videoLayerBridge->SetVideoPlane(output, dest, fence);
+   output->Release();
+   return true;
+ #else
